@@ -33,6 +33,7 @@
 
 #include "random.h"
 #include <math.h>
+#include <pthread.h>
 
 /* FIXME: Replace with a DEBUG_MC symbol for use with -d. */
 static int mc_debug = 0;
@@ -1525,7 +1526,26 @@ struct mc_game {
   int consecutive_passes;
   int consecutive_ko_captures;
   int depth;
+  /* Per-search PRNG state, owned by the enclosing uct_tree (one per worker
+   * thread).  A POINTER, so it survives the per-simulation `game = start` copy
+   * and stays thread-local -- the global gg_drand() is not thread-safe, which
+   * would otherwise block parallel search.  See mc_drand(). */
+  unsigned int *rng;
 };
+
+/* Fast thread-local PRNG (xorshift32) for the playout/selection path, in place
+ * of the global gg_drand().  Adequate for Monte-Carlo move sampling and, unlike
+ * the global RNG, gives each worker thread an independent stream. */
+static double
+mc_drand(struct mc_game *game)
+{
+  unsigned int x = *game->rng;
+  x ^= x << 13;
+  x ^= x >> 17;
+  x ^= x << 5;
+  *game->rng = x;
+  return (double) (x >> 8) * (1.0 / 16777216.0);  /* 24-bit mantissa in [0,1) */
+}
 
 
 /* Whether the playout policy should reject self-atari moves. The classic
@@ -1661,7 +1681,7 @@ mc_generate_random_move(struct mc_game *game)
     int reply = mc_lgr_reply[color == WHITE][last_move];
     if (reply != PASS_MOVE && ON_BOARD(reply) && mc->board[reply] == EMPTY
 	&& mc_is_legal(mc, reply, color)
-	&& gg_drand() < mc_lgrf_prob())
+	&& mc_drand(game) < mc_lgrf_prob())
       return reply;
   }
 
@@ -1691,8 +1711,8 @@ mc_generate_random_move(struct mc_game *game)
 	  saves[nsaves++] = lib;
       }
     }
-    if (nsaves > 0 && gg_drand() < mc_atari_prob())
-      return saves[(int) (gg_drand() * nsaves)];
+    if (nsaves > 0 && mc_drand(game) < mc_atari_prob())
+      return saves[(int) (mc_drand(game) * nsaves)];
   }
 
   if (color == WHITE) {
@@ -1755,7 +1775,7 @@ mc_generate_random_move(struct mc_game *game)
     int sa_retries = mc_avoid_self_atari_enabled() ? 2 : 0;
     do {
       /* First choose a partition. */
-      x = (int) (gg_drand() * *move_value_sum);
+      x = (int) (mc_drand(game) * *move_value_sum);
       for (k = 0; k < NUM_MOVE_PARTITIONS; k++) {
 	x -= partition_sums[k];
 	if (x < 0)
@@ -1763,7 +1783,7 @@ mc_generate_random_move(struct mc_game *game)
       }
 
       /* Then choose a move in that partition. */
-      x = (unsigned int) (gg_drand() * partition_sums[k]);
+      x = (unsigned int) (mc_drand(game) * partition_sums[k]);
       for (pos = partition_lists[k]; pos != 1; pos = partition_lists[pos]) {
 	x -= move_values[pos];
 	if (x < 0)
@@ -1974,6 +1994,7 @@ struct uct_tree {
    * that node's player's perspective -- including moves never tried as a
    * child, which is what lets RAVE order unexplored moves. */
   int root_color;
+  unsigned int rng_state;	/* this tree/thread's PRNG state (mc_drand) */
   int amaf_ply[BOARDMAX];
   int *node_amaf_wins;
   int *node_amaf_games;
@@ -2703,6 +2724,184 @@ uct_dump_tree(struct uct_tree *tree, const char *filename, int color,
 }
 
 
+/* ----------------------- Root parallelization -------------------------------
+ *
+ * The simplest, lock-free way to turn idle cores into search throughput
+ * (Chaslot et al., "Parallel Monte-Carlo Tree Search", CG 2008): run N fully
+ * INDEPENDENT UCT searches, one per thread, each in its own tree with its own
+ * PRNG stream (see mc_drand), then combine the root move statistics by summing
+ * visits/wins per move.  No shared tree, no virtual loss, no locks -- the only
+ * shared data is the read-only starting position and pattern tables.  N threads
+ * do ~N x the simulations in the same wall-clock time; the combined root is a
+ * lower-variance estimate than any single tree.  GNUGO_MC_THREADS=N (default 1,
+ * the original single-threaded behaviour, byte-identical). */
+
+static int
+mc_num_threads(void)
+{
+  static int n = -1;
+  if (n < 0) {
+    const char *v = getenv("GNUGO_MC_THREADS");
+    n = (v && *v) ? atoi(v) : 1;
+    if (n < 1)
+      n = 1;
+    if (n > 64)
+      n = 64;
+  }
+  return n;
+}
+
+/* Prime every getenv-cached tuning flag from the main thread, so the worker
+ * threads only ever READ the (already-initialised) statics -- otherwise their
+ * first concurrent call would race on the lazy initialisation. */
+static void
+mc_prime_flag_caches(void)
+{
+  (void) rave_enabled();
+  (void) grave_enabled();
+  (void) mc_value_shrink();
+  (void) mc_maxent();
+  (void) mc_avoid_self_atari_enabled();
+  (void) mc_mercy_margin();
+  (void) lgrf_enabled();
+  (void) mc_lgrf_prob();
+  (void) mc_atari_prob();
+}
+
+static void
+uct_tree_alloc(struct uct_tree *tree, int nodes)
+{
+  tree->nodes = malloc(nodes * sizeof(*tree->nodes));
+  tree->arcs = malloc(nodes * sizeof(*tree->arcs));
+  tree->hashtable_size = nodes;
+  tree->hashtable_odd = calloc(nodes, sizeof(*tree->hashtable_odd));
+  tree->hashtable_even = calloc(nodes, sizeof(*tree->hashtable_even));
+  gg_assert(tree->nodes && tree->arcs
+	    && tree->hashtable_odd && tree->hashtable_even);
+  tree->num_nodes = nodes;
+  tree->num_arcs = nodes;
+  tree->num_used_nodes = 0;
+  tree->num_used_arcs = 0;
+  tree->node_amaf_wins = NULL;
+  tree->node_amaf_games = NULL;
+  if (rave_enabled()) {
+    tree->node_amaf_wins = calloc((size_t) nodes * BOARDMAX, sizeof(int));
+    tree->node_amaf_games = calloc((size_t) nodes * BOARDMAX, sizeof(int));
+    gg_assert(tree->node_amaf_wins && tree->node_amaf_games);
+  }
+}
+
+static void
+uct_tree_release(struct uct_tree *tree)
+{
+  free(tree->nodes);
+  free(tree->arcs);
+  free(tree->hashtable_odd);
+  free(tree->hashtable_even);
+  free(tree->node_amaf_wins);
+  free(tree->node_amaf_games);
+}
+
+struct uct_worker_args {
+  struct uct_tree *tree;
+  const struct mc_game *start;	/* read-only template, copied per thread */
+  int *forbidden_moves;
+  int *allowed_moves;
+  int nodes;
+  unsigned int seed;
+};
+
+/* One independent UCT search, entirely within args->tree.  Thread entry. */
+static void *
+uct_worker(void *argp)
+{
+  struct uct_worker_args *a = argp;
+  struct uct_tree *tree = a->tree;
+  struct mc_game start = *a->start;
+
+  uct_tree_alloc(tree, a->nodes);
+  tree->rng_state = a->seed ? a->seed : 1;
+  tree->forbidden_moves = a->forbidden_moves;
+  tree->root_color = start.color_to_move;
+  start.rng = &tree->rng_state;		/* this thread's games -> its own PRNG */
+  tree->game = start;
+  uct_init_node(tree, a->allowed_moves);
+  uct_init_move_ordering(tree);
+
+  while (tree->num_used_arcs < tree->num_arcs - 10) {
+    int last_used_arcs = tree->num_used_arcs;
+    tree->game = start;			/* rng ptr preserved (-> tree->rng_state) */
+    uct_traverse_tree(tree, &tree->nodes[0], 1.0, 0.9);
+    if (tree->num_used_arcs == last_used_arcs)
+      break;
+  }
+  return NULL;
+}
+
+/* Spawn nthreads independent searches and pick the move with the best combined
+ * (summed) win rate over all root subtrees.  Fills move_values/frequencies the
+ * same way the single-threaded path does. */
+static void
+uct_genmove_parallel(int nthreads, struct mc_game *starting_position,
+		     int *forbidden_moves, int *allowed_moves, int nodes,
+		     int *move, float *move_values, int *move_frequencies)
+{
+  struct uct_tree *trees = calloc(nthreads, sizeof(*trees));
+  pthread_t *threads = malloc(nthreads * sizeof(*threads));
+  struct uct_worker_args *args = malloc(nthreads * sizeof(*args));
+  int total_games[BOARDMAX];
+  int total_wins[BOARDMAX];
+  struct uct_arc *arc;
+  float best_score = 0.0;
+  int t;
+  int pos;
+
+  gg_assert(trees && threads && args);
+  for (pos = 0; pos < BOARDMAX; pos++) {
+    total_games[pos] = 0;
+    total_wins[pos] = 0;
+  }
+
+  for (t = 0; t < nthreads; t++) {
+    /* Draw every seed in this (main) thread -- gg_drand() is not thread-safe. */
+    unsigned int s = (unsigned int) (gg_drand() * 4294967295.0);
+    args[t].tree = &trees[t];
+    args[t].start = starting_position;
+    args[t].forbidden_moves = forbidden_moves;
+    args[t].allowed_moves = allowed_moves;
+    args[t].nodes = nodes;
+    args[t].seed = s ? s : (unsigned int) (t + 1);
+    pthread_create(&threads[t], NULL, uct_worker, &args[t]);
+  }
+  for (t = 0; t < nthreads; t++)
+    pthread_join(threads[t], NULL);
+
+  for (t = 0; t < nthreads; t++)
+    for (arc = trees[t].nodes[0].child; arc; arc = arc->next) {
+      total_games[arc->move] += arc->node->games;
+      total_wins[arc->move] += arc->node->wins;
+    }
+
+  *move = PASS_MOVE;
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
+    if (total_games[pos] > 0) {
+      move_frequencies[pos] = total_games[pos];
+      move_values[pos] = (float) total_wins[pos] / total_games[pos];
+      if (best_score * total_games[pos] < total_wins[pos]) {
+	*move = pos;
+	best_score = (float) total_wins[pos] / total_games[pos];
+      }
+    }
+  }
+
+  for (t = 0; t < nthreads; t++)
+    uct_tree_release(&trees[t]);
+  free(trees);
+  free(threads);
+  free(args);
+}
+
+
 void
 uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
 	    int nodes, float *move_values, int *move_frequencies)
@@ -2727,6 +2926,26 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
   starting_position.depth = 0;
   for (pos = BOARDMIN; pos < BOARDMAX; pos++)
     starting_position.settled[pos] = forbidden_moves[pos];
+  starting_position.rng = NULL;		/* set per-thread before any playout */
+
+  /* Root parallelization: N independent searches over the cores, then combine.
+   * Prime the flag caches first so worker threads never race on lazy getenv
+   * init.  GNUGO_MC_THREADS=1 (default) falls through to the original path. */
+  mc_prime_flag_caches();
+  if (mc_num_threads() > 1) {
+    uct_genmove_parallel(mc_num_threads(), &starting_position, forbidden_moves,
+			 allowed_moves, nodes, move, move_values,
+			 move_frequencies);
+    return;
+  }
+
+  /* Seed this tree's thread-local PRNG from the global RNG (so set_random_seed
+   * still makes play reproducible) and point the game at it.  xorshift needs a
+   * nonzero state. */
+  tree.rng_state = (unsigned int) (gg_drand() * 4294967295.0);
+  if (tree.rng_state == 0)
+    tree.rng_state = 1;
+  starting_position.rng = &tree.rng_state;
 
   tree.game = starting_position;
   tree.root_color = color;

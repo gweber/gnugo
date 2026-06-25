@@ -177,7 +177,8 @@ LDADD = \
 	../engine/libengine.a \
 	../patterns/libpatterns.a \
 	../sgf/libsgf.a \
-	../utils/libutils.a
+	../utils/libutils.a \
+	-lpthread
 
 gnugo_SOURCES = \
 	main.c \

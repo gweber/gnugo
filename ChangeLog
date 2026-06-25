@@ -88,6 +88,25 @@ Playing-strength work (heuristic engine, no neural nets):
   which RAVE already smooths. The paper's gains need deep trees + full E2W
   exploration machinery, not our regime. Kept flag-off as a documented dead-end
   (don't re-try the MENTS backup family here without visit-weighting/E2W).
+- ROOT PARALLELIZATION of the Monte Carlo / UCT search (Chaslot et al.,
+  "Parallel Monte-Carlo Tree Search", CG 2008; GNUGO_MC_THREADS=N, default 1 =
+  byte-identical single-threaded behaviour). The first real throughput win after
+  MCTS: run N fully independent UCT searches, one per thread in its own tree
+  with its own PRNG, then combine the root move statistics by summing visits/
+  wins. Lock-free -- the only shared data is the read-only start position and
+  pattern tables. Two parts:
+  * per-thread PRNG (mc_drand, xorshift32): the global gg_drand() is not
+    thread-safe and blocked all parallelism. Routed the 5 playout draws through
+    a per-tree state reached via a pointer in struct mc_game (survives the
+    per-simulation copy). Strength-neutral vs gg_drand (SPRT: ~+2 Elo / 816 g).
+  * root combine across N independent trees, picking the best summed win rate.
+    Worker threads only read the getenv-cached flags (primed once in the main
+    thread to avoid init races); seeds are all drawn main-thread-side.
+  Measured (9x9, level 1, 20-core box): 8 threads do 8x the simulations in
+  ~1.12x the wall time => ~7x throughput (near-linear), converting to +53 +/- 36
+  Elo at fixed wall-clock vs 1 thread (SPRT H1, 360 games). This is the lever the
+  single-thread work pointed at. Next: tree+virtual-loss parallelization (more
+  efficient per-thread than independent root trees), tree reuse, pondering.
 - evaluated two more Moggy/Fuego playout rules, gated with a tunable fire
   PROBABILITY (Moggy-style dosing): LGRF / Last-Good-Reply (GNUGO_MC_LGRF_P)
   and atari-response (GNUGO_MC_ATARI_P). At full strength both HURT
