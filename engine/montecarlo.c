@@ -1759,6 +1759,11 @@ struct uct_arc {
   int move;
   struct uct_node *node;
   struct uct_arc *next;
+  /* RAVE / AMAF statistics for playing this->move from the parent node,
+   * measured from the parent player's perspective (same convention as
+   * child->wins).  Only maintained when RAVE is enabled. */
+  int rave_wins;
+  int rave_games;
 };
 
 struct uct_node {
@@ -1787,7 +1792,56 @@ struct uct_tree {
   int move_ordering[BOARDSIZE];
   int inverse_move_ordering[BOARDSIZE];
   int num_ordered_moves;
+  /* All-moves-as-first bookkeeping for the current simulation, used by
+   * RAVE.  amaf_ply[pos] is the first ply at which pos was played in the
+   * simulation (-1 if never), amaf_color[pos] the color that played it. */
+  int root_color;
+  int amaf_ply[BOARDMAX];
+  int amaf_color[BOARDMAX];
 };
+
+
+/* Rapid Action Value Estimation (RAVE / MC-RAVE).
+ *
+ * References:
+ *   S. Gelly and D. Silver, "Monte-Carlo tree search and rapid action
+ *     value estimation in computer Go", Artificial Intelligence 175 (2011)
+ *     1856-1875.
+ *   S. Gelly and D. Silver, "Combining Online and Offline Knowledge in
+ *     UCT", ICML 2007.
+ *
+ * RAVE shares the outcome of a simulation across every move that was
+ * played by the same player later in that simulation (the all-moves-as-
+ * first heuristic), giving each action a low-variance early estimate that
+ * is blended with the unbiased UCT estimate.  The blend weight beta decays
+ * to zero as the real visit count grows, so the asymptotic behaviour is
+ * unchanged.  We use the schedule beta = sqrt(K / (3 N + K)) where N is the
+ * child's visit count and K (the "RAVE equivalence" constant) is the number
+ * of visits at which the UCT and RAVE estimates are weighted equally.
+ *
+ * Disabled by default so behaviour is byte-identical to the baseline unless
+ * GNUGO_RAVE is set.  Validate with regression/selfplay/ before enabling by
+ * default. */
+static int rave_flag = -1;
+static float rave_equiv = 1000.0;
+
+static int
+rave_enabled(void)
+{
+  if (rave_flag < 0) {
+    const char *v = getenv("GNUGO_RAVE");
+    rave_flag = (v && *v && *v != '0') ? 1 : 0;
+    if (rave_flag) {
+      const char *k = getenv("GNUGO_RAVE_EQUIV");
+      if (k && *k) {
+	double parsed = atof(k);
+	if (parsed > 0.0)
+	  rave_equiv = (float) parsed;
+      }
+    }
+  }
+  return rave_flag;
+}
 
 
 static struct uct_node *
@@ -1849,6 +1903,8 @@ uct_find_node(struct uct_tree *tree, struct uct_node *parent, int move)
     gg_assert(tree->num_used_arcs < tree->num_arcs);
     arc->move = move;
     arc->node = node;
+    arc->rave_wins = 0;
+    arc->rave_games = 0;
     if (parent->child)
       arc->next = parent->child;
     else
@@ -1914,6 +1970,31 @@ uct_finish_and_score_game(struct mc_game *game)
   return komi + mc_play_random_game(game);
 }
 
+/* Record, for the simulation just played out, the first ply and color at
+ * which each intersection was played.  Iterating from the last ply back to
+ * the first leaves amaf_ply[] holding the earliest (first) occurrence, which
+ * is what the first-visit AMAF heuristic requires.  Colors alternate every
+ * ply (passes flip the player too), so the color is determined by parity. */
+static void
+uct_build_amaf(struct uct_tree *tree)
+{
+  int t;
+  int n = tree->game.depth;
+  int other = OTHER_COLOR(tree->root_color);
+  int pos;
+
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++)
+    tree->amaf_ply[pos] = -1;
+
+  for (t = n - 1; t >= 0; t--) {
+    int m = tree->game.move_history[t];
+    if (ON_BOARD(m)) {
+      tree->amaf_ply[m] = t;
+      tree->amaf_color[m] = (t & 1) ? other : tree->root_color;
+    }
+  }
+}
+
 static struct uct_node *
 uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
 	      float *gamma, int *move)
@@ -1924,16 +2005,31 @@ uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
   struct uct_arc *best_winrate_arc = NULL;
   float best_uct_value = 0.0;
   float best_winrate = 0.0;
-  
+  /* log(node->games) is constant across the child loop below; compute it
+   * once instead of calling log() per child (hot inner loop). */
+  float log_node_games = log(node->games);
+
   for (child_arc = node->child; child_arc; child_arc = child_arc->next) {
     struct uct_node *child_node = child_arc->node;
     float winrate = (float) child_node->wins / child_node->games;
+    float value = winrate;
     float uct_value;
-    float log_games_ratio = log(node->games) / child_node->games;
+    float log_games_ratio = log_node_games / child_node->games;
     float x = winrate * (1.0 - winrate) + sqrt(2.0 * log_games_ratio);
     if (x < 0.25)
       x = 0.25;
-    uct_value = winrate + sqrt(2 * log_games_ratio * x / (1 + tree->game.depth));
+
+    /* Blend the UCT estimate with the RAVE (all-moves-as-first) estimate.
+     * beta -> 1 when the move has few real visits but RAVE samples, and
+     * beta -> 0 as real visits accumulate, recovering plain UCT. */
+    if (rave_enabled() && child_arc->rave_games > 0) {
+      float rave_winrate = (float) child_arc->rave_wins / child_arc->rave_games;
+      float n = (float) child_node->games;
+      float beta = sqrt(rave_equiv / (3.0 * n + rave_equiv));
+      value = (1.0 - beta) * winrate + beta * rave_winrate;
+    }
+
+    uct_value = value + sqrt(2 * log_games_ratio * x / (1 + tree->game.depth));
     if (uct_value > best_uct_value) {
       next_arc = child_arc;
       best_uct_value = uct_value;
@@ -2011,18 +2107,24 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
 {
   int color = tree->game.color_to_move;
   int num_passes = tree->game.consecutive_passes;
+  int node_depth = tree->game.depth;
   float result;
   float gamma;
   int move = PASS_MOVE;
-  
+
   /* FIXME: Unify these. */
   if (num_passes == 3 || tree->game.depth >= UCT_MAX_SEARCH_DEPTH
-      || (node->games == 0 && node != tree->nodes))
+      || (node->games == 0 && node != tree->nodes)) {
     result = uct_finish_and_score_game(&tree->game);
+    /* The game is now played out to the end; capture the AMAF map once so
+     * that every node on the way back up can reuse it for RAVE updates. */
+    if (rave_enabled())
+      uct_build_amaf(tree);
+  }
   else {
     struct uct_node *next_node;
     next_node = uct_play_move(tree, node, alpha, &gamma, &move);
-    
+
     gamma += 0.00;
     if (gamma > 0.8)
       gamma = 0.8;
@@ -2038,7 +2140,24 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
 
   node->sum_scores += result;
   node->sum_scores2 += result * result;
-  
+
+  /* RAVE backup: credit this simulation to every child move that the player
+   * to move at this node played later in the simulation (all-moves-as-first).
+   * rave_wins counts wins for that player, matching child->wins. */
+  if (rave_enabled()) {
+    int player_won = ((result > 0) == (color == WHITE));
+    struct uct_arc *arc;
+    for (arc = node->child; arc; arc = arc->next) {
+      int m = arc->move;
+      if (ON_BOARD(m) && tree->amaf_ply[m] >= node_depth
+	  && tree->amaf_color[m] == color) {
+	arc->rave_games++;
+	if (player_won)
+	  arc->rave_wins++;
+      }
+    }
+  }
+
   return result;
 }
 
@@ -2137,6 +2256,7 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
     starting_position.settled[pos] = forbidden_moves[pos];
 
   tree.game = starting_position;
+  tree.root_color = color;
   /* FIXME: Don't reallocate between moves. */
   tree.nodes = malloc(nodes * sizeof(*tree.nodes));
   gg_assert(tree.nodes);

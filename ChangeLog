@@ -30,6 +30,22 @@ Playing-strength work (heuristic engine, no neural nets):
 - add a df-pn (depth-first proof-number) ladder solver module (dfpn.c),
   exposed via the GTP test command dfpn_attack; sound (validated to agree
   with attack() with zero unsound results) but scoped to ladders/captures
+- add MC-RAVE (Rapid Action Value Estimation) to the Monte Carlo / UCT
+  search (montecarlo.c), after Gelly & Silver, "Monte-Carlo tree search and
+  rapid action value estimation in computer Go", Artificial Intelligence 175
+  (2011).  Each simulation's outcome is shared, via the all-moves-as-first
+  heuristic, with every child move the same player replayed later in the
+  playout; the AMAF estimate is blended with the UCT estimate using
+  beta = sqrt(K / (3N + K)).  Gated by GNUGO_RAVE (default off, so play is
+  byte-identical to the baseline); the equivalence constant K is tunable via
+  GNUGO_RAVE_EQUIV (default 1000)
+- micro-optimize the UCT child-selection loop: hoist the loop-invariant
+  log(node->games) out of the per-child body (numerically identical)
+- selfplay harness: add reproducible per-game seeding (twogtp.py --seed),
+  pinning each engine's RNG via the set_random_seed GTP command so matches
+  are deterministic and independent of wall-clock startup time; without it
+  Monte Carlo self-play games were only diversified by 1-second time(0)
+  granularity
 
 =========================================================================
 

@@ -71,12 +71,19 @@ class GtpEngine:
             pass
 
 
-def play_game(black, white, size, komi):
+def play_game(black, white, size, komi, seed=None):
     """Play one game. Return 'B' or 'W' (winner) or None if undecided."""
     for eng in (black, white):
         eng.send(f"boardsize {size}")
         eng.send(f"komi {komi}")
         eng.send("clear_board")
+        # Pin the engine's RNG for this game so the match is reproducible and
+        # the games are independent of wall-clock startup time. Both engines
+        # share the seed, which pairs the "luck" and reduces variance in the
+        # A-vs-B comparison. Harmless for deterministic (non-Monte-Carlo)
+        # engines, which ignore the RNG.
+        if seed is not None:
+            eng.send(f"set_random_seed {seed}")
 
     engines = {"black": black, "white": white}
     passes = 0
@@ -131,6 +138,11 @@ def main():
     ap.add_argument("--size", type=int, default=9)
     ap.add_argument("--komi", type=float, default=7.5)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="base RNG seed; game g uses seed+g for both engines, "
+                         "making the match reproducible and independent of "
+                         "wall-clock time. Omit to keep each engine's default "
+                         "(time-based) seeding.")
     args = ap.parse_args()
 
     # Track wins for engine A regardless of which color it played.
@@ -141,8 +153,9 @@ def main():
         a_is_black = (g % 2 == 0)  # alternate colors for fairness
         black = GtpEngine(args.black if a_is_black else args.white)
         white = GtpEngine(args.white if a_is_black else args.black)
+        game_seed = None if args.seed is None else args.seed + g
         try:
-            winner = play_game(black, white, args.size, args.komi)
+            winner = play_game(black, white, args.size, args.komi, game_seed)
         finally:
             black.close()
             white.close()
