@@ -75,6 +75,19 @@ Playing-strength work (heuristic engine, no neural nets):
   stone-decisive early. Kept flag-off, retained for 19x19 (where playouts are
   ~4x longer). Also: -O3 -mcpu=native gives ~+5%; single-thread is otherwise
   near-optimal, so the real throughput lever is parallelism.
+- max-entropy / Boltzmann value BACKUP operator (Dam et al., "Convex
+  Regularization in MCTS", arXiv:2007.00391 -- the MENTS/TENTS family;
+  GNUGO_MC_MAXENT=tau, default 0 = off). The one MCTS lever we had never
+  touched: every prior tweak was selection-side, this changes the value BACKUP,
+  aggregating a node's children with a temperature-tau soft-max (negamax
+  complement) instead of the plain Monte-Carlo mean. Theory favours it in
+  high-branching games (Go: up to 361 moves). Measured: tau=0.1 -> -128 Elo,
+  tau=0.5 -> -159 Elo (SPRT+CRN). No sweet spot, and it gets WORSE toward the
+  mean limit -- because the soft-max aggregates children UNWEIGHTED, so widening
+  it folds in low-visit noise, which our shallow 8000-sim trees are full of and
+  which RAVE already smooths. The paper's gains need deep trees + full E2W
+  exploration machinery, not our regime. Kept flag-off as a documented dead-end
+  (don't re-try the MENTS backup family here without visit-weighting/E2W).
 - evaluated two more Moggy/Fuego playout rules, gated with a tunable fire
   PROBABILITY (Moggy-style dosing): LGRF / Last-Good-Reply (GNUGO_MC_LGRF_P)
   and atari-response (GNUGO_MC_ATARI_P). At full strength both HURT

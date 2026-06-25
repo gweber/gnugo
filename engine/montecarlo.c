@@ -1943,6 +1943,7 @@ struct uct_node {
   int games;
   float sum_scores;
   float sum_scores2;
+  float soft_w;			/* max-entropy backup value (GNUGO_MC_MAXENT) */
   struct uct_arc *child;
   struct bitboard untested;
   Hash_data boardhash;
@@ -2005,6 +2006,33 @@ struct uct_tree {
  * Disabled by default so behaviour is byte-identical to the baseline unless
  * GNUGO_RAVE is set.  Validate with regression/selfplay/ before enabling by
  * default. */
+/* Maximum-entropy / Boltzmann value BACKUP (Dam, Klink, D'Eramo, Peters,
+ * Pajarinen, "Convex Regularization in Monte-Carlo Tree Search", arXiv:
+ * 2007.00391 -- the MENTS family). Instead of backing a node's value up as the
+ * plain Monte-Carlo MEAN of its sub-tree returns, aggregate the children with a
+ * soft-max at temperature tau (in win-probability space, values being P(player
+ * who moved into the node wins)):
+ *   soft_w(node) = 1 - [ maxw + tau*log( (1/M) sum_c exp((soft_w_c - maxw)/tau) ) ]
+ * The leading "1-" is the negamax complement (the node's player maximises its
+ * own win prob; the parent sees the complement). tau -> inf recovers the mean
+ * backup; tau -> 0 gives the max backup. The theory predicts faster propagation
+ * of strong lines in high-branching games (Go has up to 361 legal moves), which
+ * is exactly where plain averaging dilutes a good line. Used as the exploitation
+ * term in UCT selection in place of wins/games. GNUGO_MC_MAXENT=tau enables it;
+ * default 0 = off (plain mean backup, behaviour unchanged). */
+static float mc_maxent_tau = -1.0;
+static float
+mc_maxent(void)
+{
+  if (mc_maxent_tau < 0.0) {
+    const char *v = getenv("GNUGO_MC_MAXENT");
+    mc_maxent_tau = (v && *v) ? (float) atof(v) : 0.0;
+    if (mc_maxent_tau < 0.0)
+      mc_maxent_tau = 0.0;
+  }
+  return mc_maxent_tau;
+}
+
 static int rave_flag = -1;
 static float rave_equiv = 100.0;  /* K (joint-tuned 2nd pass; was 1000->530) */
 static float rave_c = 0.26;        /* exploration (joint-tuned; was 0.5->0.41) */
@@ -2099,6 +2127,7 @@ uct_init_node(struct uct_tree *tree, int *allowed_moves)
   node->games = 0;
   node->sum_scores = 0.0;
   node->sum_scores2 = 0.0;
+  node->soft_w = 0.0;
   node->child = NULL;
   memset(node->untested.bits, 0, sizeof(node->untested.bits));
   for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
@@ -2344,6 +2373,7 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
   int best_pos;
   float best_pos_value;
   float shrink = mc_value_shrink();
+  float maxent_tau = mc_maxent();
 
   /* Score the existing children. */
   for (child_arc = node->child; child_arc; child_arc = child_arc->next) {
@@ -2353,11 +2383,15 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
     float winrate = shrink > 0.0
 		    ? (child_node->wins + 0.5 * shrink) / (n + shrink)
 		    : (float) child_node->wins / n;
-    float value = winrate;
+    /* Exploitation term: the max-entropy backup value when enabled, else the
+     * plain Monte-Carlo mean.  best_winrate (the gamma early-cutoff below) stays
+     * on the true mean so that logic is unchanged. */
+    float exploit = maxent_tau > 0.0 ? child_node->soft_w : winrate;
+    float value = exploit;
     if (ON_BOARD(m) && ag[m] > 0) {
       float rave = (float) aw[m] / ag[m];
       float beta = sqrt(rave_equiv / (3.0 * n + rave_equiv));
-      value = (1.0 - beta) * winrate + beta * rave;
+      value = (1.0 - beta) * exploit + beta * rave;
     }
     value += rave_c * sqrt(log_node_games / (n + 1.0));
     if (value > best_value) {
@@ -2545,6 +2579,32 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
 
   node->sum_scores += result;
   node->sum_scores2 += result * result;
+
+  /* Max-entropy value backup: re-aggregate this node's value from its children
+   * with a temperature-tau soft-max (negamax complement), instead of leaning on
+   * the wins/games mean.  Leaves (no children yet) seed it with the mean.  See
+   * mc_maxent(). */
+  {
+    float tau = mc_maxent();
+    if (tau > 0.0) {
+      if (node->child) {
+	struct uct_arc *a;
+	float maxw = -1.0e30;
+	float s = 0.0;
+	int m = 0;
+	for (a = node->child; a; a = a->next) {
+	  if (a->node->soft_w > maxw)
+	    maxw = a->node->soft_w;
+	  m++;
+	}
+	for (a = node->child; a; a = a->next)
+	  s += (float) exp((a->node->soft_w - maxw) / tau);
+	node->soft_w = 1.0 - (maxw + tau * (float) log(s / m));
+      }
+      else
+	node->soft_w = (float) node->wins / node->games;
+    }
+  }
 
   /* RAVE backup (all-moves-as-first): credit this simulation to every move
    * that the player to move at this node played later in the simulation --
