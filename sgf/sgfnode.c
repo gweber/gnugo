@@ -902,6 +902,14 @@ static int sgferrpos;
 
 static int lookahead;
 
+/* Bound on the nesting depth of SGF variations. A maliciously (or
+ * accidentally) crafted file consisting of many nested '(' subtrees
+ * would otherwise recurse through gametree() until the C stack is
+ * exhausted. No legitimate game record comes anywhere near this depth.
+ */
+#define SGF_MAX_DEPTH 1000
+static int gametree_depth;
+
 
 /* ---------------------------------------------------------------- */
 /*                       Parsing primitives                         */
@@ -1040,8 +1048,11 @@ sequence(SGFNode *n)
 
 
 static void
-gametree(SGFNode **p, SGFNode *parent, int mode) 
+gametree(SGFNode **p, SGFNode *parent, int mode)
 {
+  if (++gametree_depth > SGF_MAX_DEPTH)
+    parse_error("SGF variations nested too deeply.", 0);
+
   if (mode == STRICT_SGF)
     match('(');
   else
@@ -1076,6 +1087,8 @@ gametree(SGFNode **p, SGFNode *parent, int mode)
     if (mode == STRICT_SGF)
       match(')');
   }
+
+  gametree_depth--;
 }
 
 

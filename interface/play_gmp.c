@@ -180,6 +180,18 @@ play_gmp(Gameinfo *gameinfo, int simplified)
       else {
 	passes = 0;
 	move = POS(i, j);
+	/* The move coordinates are derived from two bytes supplied by the
+	 * GMP peer and are not guaranteed to lie on the board (a large move
+	 * value can even produce a negative coordinate).  Reject anything
+	 * that is not a legal move rather than handing an out-of-bounds
+	 * position to the board code.
+	 */
+	if (!ON_BOARD1(move) || !is_legal(move, yourcolor)) {
+	  fprintf(stderr, "GNU Go: received illegal move from gmp client\n");
+	  sgftreeAddComment(&sgftree, "got illegal move from gmp client");
+	  sgffile_output(&sgftree);
+	  return;
+	}
       }
 
       TRACE("\nyour move: %1m\n\n", move);

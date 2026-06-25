@@ -122,8 +122,12 @@ typedef struct Gmp_struct  {
  **********************************************************************/
 
 int  gmp_debug = 0;
+/* Indexed by the 3-bit command field extracted from a received packet,
+ * so this must have 8 entries: values 0-6 are the defined commands and
+ * index 7 is the "unknown" slot that an arbitrary peer can also select.
+ */
 static const char  *commandNames[] = {
-  "ACK", "DENY", "RESET", "QUERY", "RESPOND", "MOVE", "UNDO"};
+  "ACK", "DENY", "RESET", "QUERY", "RESPOND", "MOVE", "UNDO", "UNKNOWN"};
 static const char  *queryNames[] = {
   "GAME", "BUFFER SIZE", "PROTOCOL", "STONES",
   "BLACK TIME", "WHITE TIME", "CHAR SET", "RULES", "HANDICAP",

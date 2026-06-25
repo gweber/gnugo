@@ -303,7 +303,7 @@ ask_gnugo(char *gnugo_line, int verbose, const char *msg)
 	&& (line[0] == '=' || line[0] == '?'))
       strncpy(gnugo_line, line, 128);
     if (verbose)
-      printf(line);
+      printf("%s", line);
     if (debug)
       fprintf(stderr, "%s: %s\n", msg, gnugo_line);
   }
