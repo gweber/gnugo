@@ -11,7 +11,8 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/utils
 
 noinst_HEADERS = cache.h gnugo.h hash.h clock.h readconnect.h \
-                 influence.h liberty.h move_reasons.h board.h
+                 influence.h liberty.h move_reasons.h board.h \
+                 dfpn.h params.h
 
 # preconfigured settings for various configurations
 noinst_LIBRARIES = libengine.a libboard.a
@@ -24,6 +25,7 @@ libengine_a_SOURCES = \
       cache.c \
       clock.c \
       combination.c \
+      dfpn.c \
       dragon.c \
       endgame.c \
       filllib.c \

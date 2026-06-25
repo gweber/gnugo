@@ -31,6 +31,7 @@
 
 #include "interface.h"
 #include "liberty.h"
+#include "dfpn.h"
 #include "gtp.h"
 #include "gg_utils.h"
 
@@ -57,6 +58,7 @@ DECLARE(gtp_analyze_semeai);
 DECLARE(gtp_analyze_semeai_after_move);
 DECLARE(gtp_attack);
 DECLARE(gtp_attack_either);
+DECLARE(gtp_dfpn_attack);
 DECLARE(gtp_block_off);
 DECLARE(gtp_break_in);
 DECLARE(gtp_captures);
@@ -210,6 +212,7 @@ static struct gtp_command commands[] = {
   {"cputime",		      gtp_cputime},
   {"decrease_depths",  	      gtp_decrease_depths},
   {"defend",           	      gtp_defend},
+  {"dfpn_attack",             gtp_dfpn_attack},
   {"defend_both",	      gtp_defend_both},
   {"disconnect",       	      gtp_disconnect},
   {"does_attack",             gtp_does_attack},
@@ -1300,6 +1303,42 @@ gtp_attack(char *s)
   }
   return gtp_finish_response();
 }  
+
+
+/* Function:  Solve capture of a string with the df-pn solver
+ * Arguments: a vertex
+ * Fails:     invalid vertex, empty vertex
+ * Returns:   "1 <vertex>" if the string can be captured (with a capturing
+ *            move), "0" if it is safe, or "unknown" if the node limit was
+ *            reached. This drives the experimental df-pn module (dfpn.c);
+ *            it does not affect normal play.
+ */
+static int
+gtp_dfpn_attack(char *s)
+{
+  int i, j;
+  int move = NO_MOVE;
+  int result;
+
+  if (!gtp_decode_coord(s, &i, &j))
+    return gtp_failure("invalid coordinate");
+
+  if (BOARD(i, j) == EMPTY)
+    return gtp_failure("vertex must not be empty");
+
+  result = dfpn_capture(POS(i, j), 0, &move);
+  gtp_start_response(GTP_SUCCESS);
+  if (result == DFPN_UNKNOWN)
+    gtp_printf("unknown");
+  else {
+    gtp_printf("%d", result == DFPN_PROVED ? 1 : 0);
+    if (result == DFPN_PROVED && move != NO_MOVE) {
+      gtp_printf(" ");
+      gtp_print_vertex(I(move), J(move));
+    }
+  }
+  return gtp_finish_response();
+}
 
 
 /* Function:  Try to attack either of two strings

@@ -27,8 +27,9 @@ Playing-strength work (heuristic engine, no neural nets):
   multiplier; defaults reproduce historical behavior exactly
 - add an experimental history heuristic for tactical-reading move ordering
   in reading.c (GNUGO_HISTORY_HEURISTIC, default off)
-- add a df-pn (depth-first proof-number) capture solver module (dfpn.c),
-  exposed via the GTP test command dfpn_attack
+- add a df-pn (depth-first proof-number) ladder solver module (dfpn.c),
+  exposed via the GTP test command dfpn_attack; sound (validated to agree
+  with attack() with zero unsound results) but scoped to ladders/captures
 
 =========================================================================
 

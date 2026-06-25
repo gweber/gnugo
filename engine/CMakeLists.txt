@@ -14,6 +14,7 @@ SET(engine_STAT_SRCS
     cache.c
     clock.c
     combination.c
+    dfpn.c
     dragon.c
     endgame.c
     filllib.c
