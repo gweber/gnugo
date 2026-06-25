@@ -1554,32 +1554,54 @@ mc_avoid_self_atari_enabled(void)
  * by (color == WHITE). 0 (= NO_MOVE/PASS) means "no stored reply". Gated by
  * GNUGO_MC_LGRF (default off). The table is reset per genmove. */
 static int mc_lgr_reply[2][BOARDMAX];
-static int mc_lgrf_flag = -1;
 
+/* Fire PROBABILITY for the tactical override rules (Moggy-style dosing):
+ * each time the rule could fire in a playout, it does so only with this
+ * probability, otherwise the normal pattern policy is used. As an always-on
+ * (probability 1) override these rules unbalance the simulations and lose
+ * Elo; the dose is the knob a tuned Moggy cascade controls. GNUGO_MC_LGRF_P
+ * and GNUGO_MC_ATARI_P set it in [0,1]; the legacy on/off flags map to 1.0.
+ * Default 0 = off (behavior unchanged). */
+static float mc_lgrf_prob_val = -1.0;
+static float mc_atari_prob_val = -1.0;
+
+static float
+mc_prob_getenv(const char *prob_var, const char *legacy_flag)
+{
+  const char *p = getenv(prob_var);
+  float v;
+  if (p && *p)
+    v = (float) atof(p);
+  else
+    v = getenv(legacy_flag) ? 1.0 : 0.0;
+  if (v < 0.0)
+    v = 0.0;
+  if (v > 1.0)
+    v = 1.0;
+  return v;
+}
+
+static float
+mc_lgrf_prob(void)
+{
+  if (mc_lgrf_prob_val < 0.0)
+    mc_lgrf_prob_val = mc_prob_getenv("GNUGO_MC_LGRF_P", "GNUGO_MC_LGRF");
+  return mc_lgrf_prob_val;
+}
+
+/* Whether LGRF bookkeeping (table update/reset) is active at all. */
 static int
 lgrf_enabled(void)
 {
-  if (mc_lgrf_flag < 0) {
-    const char *v = getenv("GNUGO_MC_LGRF");
-    mc_lgrf_flag = (v && *v && *v != '0') ? 1 : 0;
-  }
-  return mc_lgrf_flag;
+  return mc_lgrf_prob() > 0.0;
 }
 
-/* Atari response (Moggy/Fuego light-playout rule): when the opponent's last
- * move puts one of our strings in atari, save it by playing its remaining
- * liberty -- unless that is a useless self-atari that captures nothing.
- * Gated by GNUGO_MC_ATARI (default off). */
-static int mc_atari_flag = -1;
-
-static int
-mc_atari_response_enabled(void)
+static float
+mc_atari_prob(void)
 {
-  if (mc_atari_flag < 0) {
-    const char *v = getenv("GNUGO_MC_ATARI");
-    mc_atari_flag = (v && *v && *v != '0') ? 1 : 0;
-  }
-  return mc_atari_flag;
+  if (mc_atari_prob_val < 0.0)
+    mc_atari_prob_val = mc_prob_getenv("GNUGO_MC_ATARI_P", "GNUGO_MC_ATARI");
+  return mc_atari_prob_val;
 }
 
 
@@ -1638,14 +1660,15 @@ mc_generate_random_move(struct mc_game *game)
   if (lgrf_enabled() && last_move != PASS_MOVE && ON_BOARD(last_move)) {
     int reply = mc_lgr_reply[color == WHITE][last_move];
     if (reply != PASS_MOVE && ON_BOARD(reply) && mc->board[reply] == EMPTY
-	&& mc_is_legal(mc, reply, color))
+	&& mc_is_legal(mc, reply, color)
+	&& gg_drand() < mc_lgrf_prob())
       return reply;
   }
 
   /* Atari response: if the opponent's last move put one of our adjacent
    * strings in atari, save it by playing its remaining liberty, unless that
    * is a useless self-atari that captures nothing. Play a random one. */
-  if (mc_atari_response_enabled() && last_move != PASS_MOVE
+  if (mc_atari_prob() > 0.0 && last_move != PASS_MOVE
       && ON_BOARD(last_move)) {
     int saves[4];
     int nsaves = 0;
@@ -1668,7 +1691,7 @@ mc_generate_random_move(struct mc_game *game)
 	  saves[nsaves++] = lib;
       }
     }
-    if (nsaves > 0)
+    if (nsaves > 0 && gg_drand() < mc_atari_prob())
       return saves[(int) (gg_drand() * nsaves)];
   }
 
@@ -1930,9 +1953,9 @@ struct uct_tree {
  * GNUGO_RAVE is set.  Validate with regression/selfplay/ before enabling by
  * default. */
 static int rave_flag = -1;
-static float rave_equiv = 530.0;  /* K (joint-tuned; was 1000) */
-static float rave_c = 0.41;        /* exploration (joint-tuned; was 0.5) */
-static float rave_fpu = 0.57;      /* first-play value (joint-tuned; was 0.5) */
+static float rave_equiv = 100.0;  /* K (joint-tuned 2nd pass; was 1000->530) */
+static float rave_c = 0.26;        /* exploration (joint-tuned; was 0.5->0.41) */
+static float rave_fpu = 0.64;      /* first-play value (joint-tuned; was 0.5->0.57) */
 
 static void
 rave_getenv_float(const char *name, float *target)

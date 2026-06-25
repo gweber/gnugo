@@ -39,16 +39,23 @@ Playing-strength work (heuristic engine, no neural nets):
 - evaluated GRAVE (Generalized RAVE, Cazenave 2015) on top of RAVE: measured
   -27 +/- 28 Elo over 600 games (it adds noise to GNU Go's already-strong
   per-node RAVE), so it was NOT adopted (kept flag-gated for 19x19 retest)
-- joint-tuned the (untuned) RAVE constants via parallel SPSA with the full
-  stack enabled: adopted RAVE_EQUIV 1000->530, RAVE_C 0.5->0.41,
-  RAVE_FPU 0.5->0.57 (+14 +/- 28 Elo over 600 games on 9x9)
-- evaluated two more Moggy/Fuego playout rules, both flag-gated and both
-  measured to HURT on 9x9, so NOT enabled (retained for 19x19 retest):
-  LGRF / Last-Good-Reply (GNUGO_MC_LGRF, -45 +/- 34) and atari-response
-  (GNUGO_MC_ATARI, -42 +/- 40). Instructive: forcing "stronger" tactical
-  playout moves unbalances the simulations (cf. Silver & Tesauro,
-  simulation balancing) -- only self-atari *avoidance* (removing bad moves)
-  helped. Useful negative results that map the search space.
+- joint-tuned the (badly miscalibrated, untuned) RAVE constants via parallel
+  SPSA with the full stack enabled -- the largest gain of this work. Two
+  passes lowered RAVE_EQUIV 1000 -> 530 -> 100, RAVE_C 0.5 -> 0.26,
+  RAVE_FPU 0.5 -> 0.64. Validated +92 +/- 41 Elo (equiv=100 vs equiv=530) and
+  ~+90-105 Elo over the original defaults, at equal compute on 9x9. The low
+  equiv means RAVE hands off to UCT quickly (AMAF used mainly to order
+  unexplored moves). With this, the MC stack beats classical GNU Go by
+  +37 +/- 34 Elo at *equal compute* (classical level 10), up from a marginal
+  +24 before tuning -- i.e. a real edge, not just bought with CPU.
+- evaluated two more Moggy/Fuego playout rules, gated with a tunable fire
+  PROBABILITY (Moggy-style dosing): LGRF / Last-Good-Reply (GNUGO_MC_LGRF_P)
+  and atari-response (GNUGO_MC_ATARI_P). At full strength both HURT
+  (-45 +/- 34, -42 +/- 40); a joint SPSA tune drove their optimal dose to
+  ~0.02 (effectively off), confirming they do not help on 9x9 even dosed --
+  forcing "stronger" tactical playout moves unbalances the simulations (cf.
+  Silver & Tesauro, simulation balancing). Only self-atari *avoidance*
+  (removing bad moves) helped. Knobs retained (default 0 = off) for 19x19.
 - add a global selective-search prototype (regression/selfplay/selective_engine.py):
   one-ply lookahead over gnugo's own top moves scored by estimate_score;
   measured strength-neutral at 1 ply (see SELECTIVE_SEARCH.md) -- mechanism
