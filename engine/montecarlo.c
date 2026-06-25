@@ -1961,6 +1961,7 @@ struct uct_arc {
 struct uct_node {
   int wins;
   int games;
+  int virtual_loss;		/* threads currently descending here (tree-parallel) */
   float sum_scores;
   float sum_scores2;
   float soft_w;			/* max-entropy backup value (GNUGO_MC_MAXENT) */
@@ -1995,6 +1996,14 @@ struct uct_tree {
    * child, which is what lets RAVE order unexplored moves. */
   int root_color;
   unsigned int rng_state;	/* this tree/thread's PRNG state (mc_drand) */
+  /* Tree-parallel (GNUGO_MC_TREE_THREADS): when `parallel` is set this view
+   * shares nodes[]/arcs[]/node_amaf_* with sibling threads and allocates from
+   * the shared atomic cursors *p_used_nodes / *p_used_arcs instead of its own
+   * num_used_*.  Zero otherwise -- single-thread and root-parallel are
+   * unaffected. */
+  int parallel;
+  int *p_used_nodes;
+  int *p_used_arcs;
   int amaf_ply[BOARDMAX];
   int *node_amaf_wins;
   int *node_amaf_games;
@@ -2142,10 +2151,17 @@ static struct uct_node *
 uct_init_node(struct uct_tree *tree, int *allowed_moves)
 {
   int pos;
-  struct uct_node *node = &tree->nodes[tree->num_used_nodes++];
+  int idx = tree->parallel
+	    ? __atomic_fetch_add(tree->p_used_nodes, 1, __ATOMIC_RELAXED)
+	    : tree->num_used_nodes++;
+  struct uct_node *node;
+  if (tree->parallel && idx >= tree->num_nodes)
+    idx = tree->num_nodes - 1;		/* capacity backstop: reuse last slot */
+  node = &tree->nodes[idx];
 
   node->wins = 0;
   node->games = 0;
+  node->virtual_loss = 0;
   node->sum_scores = 0.0;
   node->sum_scores2 = 0.0;
   node->soft_w = 0.0;
@@ -2163,14 +2179,74 @@ uct_init_node(struct uct_tree *tree, int *allowed_moves)
   return node;
 }
 
+/* Sharded mutex pool guarding child-list expansion in tree-parallel mode.
+ * Power-of-two so node index can be masked.  Initialised once, main-thread. */
+#define UCT_NUM_LOCKS 4096
+static pthread_mutex_t uct_lock_pool[UCT_NUM_LOCKS];
+static int uct_lock_pool_inited = 0;
+
+static void
+uct_locks_init(void)
+{
+  int i;
+  if (uct_lock_pool_inited)
+    return;
+  for (i = 0; i < UCT_NUM_LOCKS; i++)
+    pthread_mutex_init(&uct_lock_pool[i], NULL);
+  uct_lock_pool_inited = 1;
+}
+
+static pthread_mutex_t *
+uct_node_lock(struct uct_tree *tree, struct uct_node *node)
+{
+  return &uct_lock_pool[(int) (node - tree->nodes) & (UCT_NUM_LOCKS - 1)];
+}
+
 static struct uct_node *
 uct_find_node(struct uct_tree *tree, struct uct_node *parent, int move)
 {
   struct uct_node *node = NULL;
-  Hash_data *boardhash = &tree->game.mc.hash;
-  unsigned int hash_index = hashdata_remainder(*boardhash,
-					       tree->hashtable_size);
-  unsigned int *hashtable = tree->hashtable_even;
+  Hash_data *boardhash;
+  unsigned int hash_index;
+  unsigned int *hashtable;
+
+  /* Tree-parallel: a pure tree (no transposition table -- that race isn't worth
+   * its weight).  Under the parent's lock, reuse an existing child for this move
+   * (another thread may have just expanded it) or create one.  Allocation uses
+   * the shared atomic cursors. */
+  if (tree->parallel) {
+    struct uct_arc *arc;
+    pthread_mutex_t *plock = parent ? uct_node_lock(tree, parent) : NULL;
+    if (plock)
+      pthread_mutex_lock(plock);
+    if (parent)
+      for (arc = parent->child; arc; arc = arc->next)
+	if (arc->move == move) {
+	  if (plock)
+	    pthread_mutex_unlock(plock);
+	  return arc->node;
+	}
+    node = uct_init_node(tree, NULL);
+    if (parent) {
+      int aidx = __atomic_fetch_add(tree->p_used_arcs, 1, __ATOMIC_RELAXED);
+      if (aidx >= tree->num_arcs)
+	aidx = tree->num_arcs - 1;	/* capacity backstop */
+      arc = &tree->arcs[aidx];
+      arc->move = move;
+      arc->node = node;
+      arc->next = parent->child;
+      /* Publish the fully-constructed arc with a release store so concurrent
+       * (lock-free) readers of the child list never see a half-linked head.
+       * Prepend-only => already-published arcs are immutable. */
+      __atomic_store_n(&parent->child, arc, __ATOMIC_RELEASE);
+      pthread_mutex_unlock(plock);
+    }
+    return node;
+  }
+
+  boardhash = &tree->game.mc.hash;
+  hash_index = hashdata_remainder(*boardhash, tree->hashtable_size);
+  hashtable = tree->hashtable_even;
   if (tree->game.depth & 1)
     hashtable = tree->hashtable_odd;
 
@@ -2396,11 +2472,19 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
   float shrink = mc_value_shrink();
   float maxent_tau = mc_maxent();
 
-  /* Score the existing children. */
-  for (child_arc = node->child; child_arc; child_arc = child_arc->next) {
+  /* Score the existing children.  In tree-parallel mode load the list head with
+   * an acquire to pair with the release publish in uct_find_node (older arcs are
+   * immutable, so only the head needs ordering). */
+  child_arc = tree->parallel
+	      ? __atomic_load_n(&node->child, __ATOMIC_ACQUIRE) : node->child;
+  for (; child_arc; child_arc = child_arc->next) {
     struct uct_node *child_node = child_arc->node;
     int m = child_arc->move;
-    float n = (float) child_node->games;
+    /* Virtual loss (tree-parallel): count threads currently exploring this
+     * child as extra visits with no wins, so concurrent threads diverge. */
+    int vl = tree->parallel
+	     ? __atomic_load_n(&child_node->virtual_loss, __ATOMIC_RELAXED) : 0;
+    float n = (float) (child_node->games + vl);
     float winrate = shrink > 0.0
 		    ? (child_node->wins + 0.5 * shrink) / (n + shrink)
 		    : (float) child_node->wins / n;
@@ -2655,6 +2739,209 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
   return result;
 }
 
+/* Tree-parallel traversal (Chaslot et al.; Enzenberger & Mueller's lock-free
+ * Fuego): one descent on the SHARED tree by one worker thread.  Same policy as
+ * uct_traverse_tree, but visit/win/AMAF updates are atomic, a virtual loss is
+ * applied to each node while a thread is below it (so siblings diverge), and
+ * expansion goes through the locked pure-tree branch of uct_find_node.  The
+ * max-entropy and LGRF paths are intentionally skipped (off by default; both
+ * would need their own synchronisation). */
+static float
+uct_traverse_tree_parallel(struct uct_tree *tree, struct uct_node *node,
+			   float alpha, float beta)
+{
+  int color = tree->game.color_to_move;
+  int node_depth = tree->game.depth;
+  int num_passes = tree->game.consecutive_passes;
+  float result;
+  float gamma;
+  int move = PASS_MOVE;
+
+  if (node == tree->nodes) {
+    tree->grave_ref_base[0] = -1;
+    tree->grave_ref_base[1] = -1;
+  }
+  if (grave_enabled() && node->games >= grave_ref)
+    tree->grave_ref_base[color == WHITE] = (int) (node - tree->nodes) * BOARDMAX;
+
+  if (num_passes == 3 || tree->game.depth >= UCT_MAX_SEARCH_DEPTH
+      || (node->games == 0 && node != tree->nodes)) {
+    result = uct_finish_and_score_game(&tree->game);
+    if (rave_enabled())
+      uct_build_amaf(tree);
+  }
+  else {
+    struct uct_node *next_node = uct_play_move(tree, node, alpha, &gamma, &move);
+    __atomic_fetch_add(&next_node->virtual_loss, 1, __ATOMIC_RELAXED);
+    if (gamma > 0.8)
+      gamma = 0.8;
+    result = uct_traverse_tree_parallel(tree, next_node, beta, gamma);
+    __atomic_fetch_sub(&next_node->virtual_loss, 1, __ATOMIC_RELAXED);
+  }
+
+  __atomic_fetch_add(&node->games, 1, __ATOMIC_RELAXED);
+  if ((result > 0) ^ (color == WHITE)) {
+    __atomic_fetch_add(&node->wins, 1, __ATOMIC_RELAXED);
+    if (move != PASS_MOVE)
+      uct_update_move_ordering(tree, move);	/* per-view ordering */
+  }
+  node->sum_scores += result;			/* racy debug stats -- benign */
+  node->sum_scores2 += result * result;
+
+  if (rave_enabled()) {
+    int player_won = ((result > 0) == (color == WHITE));
+    int base = (int) (node - tree->nodes) * BOARDMAX;
+    int *aw = tree->node_amaf_wins + base;
+    int *ag = tree->node_amaf_games + base;
+    int final_depth = tree->game.depth;
+    int t;
+    for (t = node_depth; t < final_depth; t++) {
+      int m = tree->game.move_history[t];
+      if (((t ^ node_depth) & 1))
+	continue;
+      if (!ON_BOARD(m) || tree->amaf_ply[m] != t)
+	continue;
+      __atomic_fetch_add(&ag[m], 1, __ATOMIC_RELAXED);
+      if (player_won)
+	__atomic_fetch_add(&aw[m], 1, __ATOMIC_RELAXED);
+    }
+  }
+
+  return result;
+}
+
+static int
+mc_num_tree_threads(void)
+{
+  static int n = -1;
+  if (n < 0) {
+    const char *v = getenv("GNUGO_MC_TREE_THREADS");
+    n = (v && *v) ? atoi(v) : 1;
+    if (n < 1)
+      n = 1;
+    if (n > 64)
+      n = 64;
+  }
+  return n;
+}
+
+struct uct_tree_worker_args {
+  struct uct_tree *view;
+  const struct mc_game *start;
+  int sim_cap;
+};
+
+/* One worker thread: repeatedly descend the shared tree until this thread has
+ * run sim_cap simulations or the shared node/arc pool is nearly full. */
+static void *
+uct_tree_worker(void *argp)
+{
+  struct uct_tree_worker_args *a = argp;
+  struct uct_tree *v = a->view;
+  struct uct_node *root = &v->nodes[0];
+  int sims = 0;
+
+  uct_init_move_ordering(v);
+  while (sims < a->sim_cap
+	 && __atomic_load_n(v->p_used_nodes, __ATOMIC_RELAXED) < v->num_nodes - 64
+	 && __atomic_load_n(v->p_used_arcs, __ATOMIC_RELAXED) < v->num_arcs - 64) {
+    v->game = *a->start;
+    v->game.rng = &v->rng_state;
+    uct_traverse_tree_parallel(v, root, 1.0, 0.9);
+    sims++;
+  }
+  return NULL;
+}
+
+/* Tree parallelization: nthreads workers share ONE tree (sized for the combined
+ * sim budget), so unlike root parallelization they pool information rather than
+ * search independently.  Each does sim_cap = nodes simulations, for ~nthreads x
+ * nodes total in a single coherent tree. */
+static void
+uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
+			  int *forbidden_moves, int *allowed_moves, int nodes,
+			  int *move, float *move_values, int *move_frequencies)
+{
+  int total = nodes * nthreads + 1024;	/* headroom over the sim budget */
+  struct uct_node *shared_nodes = malloc((size_t) total * sizeof(*shared_nodes));
+  struct uct_arc *shared_arcs = malloc((size_t) total * sizeof(*shared_arcs));
+  int *shared_amaf_w = NULL;
+  int *shared_amaf_g = NULL;
+  int used_nodes = 0;
+  int used_arcs = 0;
+  struct uct_tree *views = calloc(nthreads, sizeof(*views));
+  pthread_t *threads = malloc(nthreads * sizeof(*threads));
+  struct uct_tree_worker_args *args = malloc(nthreads * sizeof(*args));
+  struct uct_node *root;
+  struct uct_arc *arc;
+  float best_score = 0.0;
+  int t;
+
+  gg_assert(shared_nodes && shared_arcs && views && threads && args);
+  if (rave_enabled()) {
+    shared_amaf_w = calloc((size_t) total * BOARDMAX, sizeof(int));
+    shared_amaf_g = calloc((size_t) total * BOARDMAX, sizeof(int));
+    gg_assert(shared_amaf_w && shared_amaf_g);
+  }
+  uct_locks_init();
+
+  for (t = 0; t < nthreads; t++) {
+    unsigned int s = (unsigned int) (gg_drand() * 4294967295.0);
+    struct uct_tree *v = &views[t];
+    v->nodes = shared_nodes;
+    v->arcs = shared_arcs;
+    v->num_nodes = total;
+    v->num_arcs = total;
+    v->node_amaf_wins = shared_amaf_w;
+    v->node_amaf_games = shared_amaf_g;
+    v->parallel = 1;
+    v->p_used_nodes = &used_nodes;
+    v->p_used_arcs = &used_arcs;
+    v->hashtable_odd = NULL;
+    v->hashtable_even = NULL;
+    v->hashtable_size = 0;
+    v->forbidden_moves = forbidden_moves;
+    v->root_color = starting_position->color_to_move;
+    v->rng_state = s ? s : (unsigned int) (t + 1);
+    v->game = *starting_position;
+    v->game.rng = &v->rng_state;
+  }
+
+  /* Initialise the shared root (index 0) once, before any worker runs. */
+  uct_init_node(&views[0], allowed_moves);
+  root = &shared_nodes[0];
+
+  for (t = 0; t < nthreads; t++) {
+    args[t].view = &views[t];
+    args[t].start = starting_position;
+    args[t].sim_cap = nodes;
+    pthread_create(&threads[t], NULL, uct_tree_worker, &args[t]);
+  }
+  for (t = 0; t < nthreads; t++)
+    pthread_join(threads[t], NULL);
+
+  *move = PASS_MOVE;
+  for (arc = root->child; arc; arc = arc->next) {
+    struct uct_node *node = arc->node;
+    if (node->games == 0)
+      continue;
+    move_frequencies[arc->move] = node->games;
+    move_values[arc->move] = (float) node->wins / node->games;
+    if (best_score * node->games < node->wins) {
+      *move = arc->move;
+      best_score = (float) node->wins / node->games;
+    }
+  }
+
+  free(shared_nodes);
+  free(shared_arcs);
+  free(shared_amaf_w);
+  free(shared_amaf_g);
+  free(views);
+  free(threads);
+  free(args);
+}
+
 static int
 uct_find_best_children(struct uct_node *node, struct uct_arc **children,
 		       int n)
@@ -2782,6 +3069,7 @@ uct_tree_alloc(struct uct_tree *tree, int nodes)
   tree->num_arcs = nodes;
   tree->num_used_nodes = 0;
   tree->num_used_arcs = 0;
+  tree->parallel = 0;
   tree->node_amaf_wins = NULL;
   tree->node_amaf_games = NULL;
   if (rave_enabled()) {
@@ -2932,6 +3220,12 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
    * Prime the flag caches first so worker threads never race on lazy getenv
    * init.  GNUGO_MC_THREADS=1 (default) falls through to the original path. */
   mc_prime_flag_caches();
+  if (mc_num_tree_threads() > 1) {
+    uct_genmove_tree_parallel(mc_num_tree_threads(), &starting_position,
+			      forbidden_moves, allowed_moves, nodes, move,
+			      move_values, move_frequencies);
+    return;
+  }
   if (mc_num_threads() > 1) {
     uct_genmove_parallel(mc_num_threads(), &starting_position, forbidden_moves,
 			 allowed_moves, nodes, move, move_values,
@@ -2967,6 +3261,7 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
   tree.num_arcs = nodes;
   tree.num_used_nodes = 0;
   tree.num_used_arcs = 0;
+  tree.parallel = 0;
   tree.forbidden_moves = forbidden_moves;
   /* Per-node AMAF tables for RAVE: one [BOARDMAX] row per node.  Allocated
    * only when RAVE is enabled; calloc + demand paging keeps resident memory

@@ -107,6 +107,27 @@ Playing-strength work (heuristic engine, no neural nets):
   Elo at fixed wall-clock vs 1 thread (SPRT H1, 360 games). This is the lever the
   single-thread work pointed at. Next: tree+virtual-loss parallelization (more
   efficient per-thread than independent root trees), tree reuse, pondering.
+- TREE PARALLELIZATION with virtual loss (Chaslot et al. 2008; Enzenberger &
+  Mueller's lock-free Fuego; GNUGO_MC_TREE_THREADS=N, default 1 = off). N worker
+  threads share ONE tree (sized for the combined budget) instead of searching
+  independent trees, so they POOL information into a single deep, coherent search
+  rather than N shallow ones. Mechanics:
+  * shared nodes/arcs/AMAF storage with N per-thread "views" (own game / PRNG /
+    AMAF-ply / move-ordering), so uct_play_move_rave is reused unchanged;
+  * atomic allocation cursor, atomic visit/win/AMAF backup;
+  * virtual loss (atomic per-node counter, folded into the selection visit count)
+    so concurrent threads diverge down different lines;
+  * one sharded-mutex-pool lock guarding child-list expansion (dedup + prepend),
+    with a release/acquire pair so lock-free readers never see a half-linked head
+    (the bug that first showed up as a segfault); pure tree in parallel mode (the
+    transposition hashtable is skipped -- that race isn't worth its weight).
+  Measured (9x9, level 1): ~6x throughput at 8 threads (vs root's ~7x; the extra
+  overhead is lock/cache contention on the shared tree). At EQUAL total sims it
+  beats root parallelization by +237 +/- 85 Elo (SPRT H1, 108 games) -- root's
+  independent trees each only reach 8000-sim depth, while the shared tree
+  develops one coherent 64000-sim search that reads deep on the best lines. So
+  tree+virtual-loss is the superior parallel mode; kept gated/experimental
+  pending wider-board and longer-search validation. Next: tree reuse, pondering.
 - evaluated two more Moggy/Fuego playout rules, gated with a tunable fire
   PROBABILITY (Moggy-style dosing): LGRF / Last-Good-Reply (GNUGO_MC_LGRF_P)
   and atari-response (GNUGO_MC_ATARI_P). At full strength both HURT
