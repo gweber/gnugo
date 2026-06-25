@@ -1,3 +1,13 @@
+Unreleased (modernization branch)
+
+- builds cleanly with modern GCC/Clang (fixes -fno-common link error)
+- compiler warnings reduced from 162 to 13 on GCC 13
+- fixed a latent logic bug in owl pattern VA32 (constraint was always
+  false due to operator precedence) and a partial-zeroing memset in the
+  break-in code
+- continuous integration via GitHub Actions (build + regression smoke test)
+- see MODERNIZATION.md for details
+
 New in 3.8 (since 3.6)
 
 - many small improvements and tuning since 3.6
