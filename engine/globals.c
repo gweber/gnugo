@@ -27,7 +27,21 @@
 
 #include "sgftree.h"
 #include "liberty.h"
+#include "params.h"
 #include "config.h"
+
+/* Runtime-tunable strength parameters; defaults reproduce historical
+ * hard-coded behavior. Overridable via GNUGO_* env vars (see params.h and
+ * load_tunable_params() in interface.c). */
+struct tunable_params tunable = {
+  1.0,    /* territorial_weight_scale */
+  1.0,    /* strategical_weight_scale */
+  1.0,    /* attack_dragon_weight_scale */
+  1.0,    /* followup_weight_scale */
+  1.0,    /* invasion_malus_weight_scale */
+  1.05,   /* shape_factor_base */
+  1.8     /* lunch_weakness_multiplier */
+};
 
 /* 
  * Define all global variables used within the engine.
