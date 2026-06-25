@@ -102,9 +102,22 @@ init_gnugo(float memory, unsigned int seed)
 int check_boardsize(int boardsize, FILE *out)
 {
   int max_board = MAX_BOARD;
-  if (use_monte_carlo_genmove && max_board > 9)
-    max_board = 9;
-  
+  /* Monte Carlo mode was historically capped at 9x9 because its playout
+   * policy is too weak (and its simulation budget too small) to play well on
+   * larger boards. The data structures, however, scale to MAX_BOARD, so the
+   * cap is lifted to GNUGO_MC_MAX_BOARD (default MAX_BOARD) to evaluate
+   * larger boards; set it to 9 to restore the historical behavior. */
+  if (use_monte_carlo_genmove) {
+    const char *v = getenv("GNUGO_MC_MAX_BOARD");
+    int mc_max = (v && *v) ? atoi(v) : MAX_BOARD;
+    if (mc_max < MIN_BOARD)
+      mc_max = MIN_BOARD;
+    if (mc_max > MAX_BOARD)
+      mc_max = MAX_BOARD;
+    if (max_board > mc_max)
+      max_board = mc_max;
+  }
+
   if (boardsize < MIN_BOARD || boardsize > max_board) {
     if (out) {
       fprintf(out, "Unsupported board size: %d. ", boardsize);
