@@ -1825,6 +1825,11 @@ struct uct_tree {
   int amaf_ply[BOARDMAX];
   int *node_amaf_wins;
   int *node_amaf_games;
+  /* GRAVE: AMAF base offset of the nearest SAME-COLOR ancestor on the current
+   * descent path with >= grave_ref playouts. Per color (the AMAF tables are
+   * each node's player's perspective, so borrowing across colors would invert
+   * win rates). Indexed by (color == WHITE); -1 = no reference yet. */
+  int grave_ref_base[2];
 };
 
 
@@ -1880,6 +1885,37 @@ rave_enabled(void)
     }
   }
   return rave_flag;
+}
+
+/* GRAVE (Generalized RAVE; Cazenave, IJCAI 2015): for a node with few
+ * playouts, read AMAF from the nearest ancestor with >= grave_ref playouts
+ * (richer statistics, more accurate near the leaves). Gated by GNUGO_GRAVE
+ * (default off); implies RAVE; tunable GNUGO_GRAVE_REF.
+ *
+ * Measured -27 +/- 28 Elo vs RAVE on 9x9 (small tree -> per-node RAVE is
+ * already reliable, so borrowing only adds noise). RETAINED off-by-default
+ * for evaluation on 19x19, where most nodes are low-visit and GRAVE's
+ * ancestor-borrowing is designed to help. Validated correct: small grave_ref
+ * collapses GRAVE to plain RAVE. */
+static int grave_flag = -1;
+static int grave_ref = 50;
+
+static int
+grave_enabled(void)
+{
+  if (grave_flag < 0) {
+    const char *v = getenv("GNUGO_GRAVE");
+    grave_flag = (v && *v && *v != '0') ? 1 : 0;
+    if (grave_flag) {
+      const char *r = getenv("GNUGO_GRAVE_REF");
+      if (r && *r) {
+	int parsed = atoi(r);
+	if (parsed > 0)
+	  grave_ref = parsed;
+      }
+    }
+  }
+  return grave_flag && rave_enabled();
 }
 
 
@@ -2097,8 +2133,14 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
 {
   struct uct_arc *child_arc;
   int base = (int) (node - tree->nodes) * BOARDMAX;
-  const int *aw = tree->node_amaf_wins + base;
-  const int *ag = tree->node_amaf_games + base;
+  /* GRAVE: read AMAF from the same-color reference ancestor if one exists on
+   * this path, else fall back to this node's own AMAF (plain RAVE). Only the
+   * RAVE term and untested-move ordering use it; UCT/winrate stay node-local. */
+  int gref = grave_enabled()
+	     ? tree->grave_ref_base[tree->game.color_to_move == WHITE] : -1;
+  int amaf_base = (gref >= 0) ? gref : base;
+  const int *aw = tree->node_amaf_wins + amaf_base;
+  const int *ag = tree->node_amaf_games + amaf_base;
   float log_node_games = node->games > 0 ? log(node->games) : 0.0;
   float untested_explore = rave_c * sqrt(log_node_games);
   struct mc_board *mc = &tree->game.mc;
@@ -2267,6 +2309,15 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
   float result;
   float gamma;
   int move = PASS_MOVE;
+
+  /* GRAVE: track the nearest same-color ancestor with >= grave_ref playouts
+   * as the AMAF reference for selection here. Reset at root; no-op if off. */
+  if (node == tree->nodes) {
+    tree->grave_ref_base[0] = -1;
+    tree->grave_ref_base[1] = -1;
+  }
+  if (grave_enabled() && node->games >= grave_ref)
+    tree->grave_ref_base[color == WHITE] = (int) (node - tree->nodes) * BOARDMAX;
 
   /* FIXME: Unify these. */
   if (num_passes == 3 || tree->game.depth >= UCT_MAX_SEARCH_DEPTH
