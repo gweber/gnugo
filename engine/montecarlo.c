@@ -1759,11 +1759,6 @@ struct uct_arc {
   int move;
   struct uct_node *node;
   struct uct_arc *next;
-  /* RAVE / AMAF statistics for playing this->move from the parent node,
-   * measured from the parent player's perspective (same convention as
-   * child->wins).  Only maintained when RAVE is enabled. */
-  int rave_wins;
-  int rave_games;
 };
 
 struct uct_node {
@@ -1792,12 +1787,18 @@ struct uct_tree {
   int move_ordering[BOARDSIZE];
   int inverse_move_ordering[BOARDSIZE];
   int num_ordered_moves;
-  /* All-moves-as-first bookkeeping for the current simulation, used by
-   * RAVE.  amaf_ply[pos] is the first ply at which pos was played in the
-   * simulation (-1 if never), amaf_color[pos] the color that played it. */
+  /* RAVE bookkeeping (allocated only when RAVE is enabled).
+   * amaf_ply[pos] is the first ply at which pos was played in the current
+   * simulation (-1 if never); it is rebuilt once per playout and used to
+   * credit each node's per-move AMAF table with first-visit semantics.
+   * node_amaf_{wins,games} are flat [num_nodes * BOARDMAX] tables giving,
+   * for every node and every board point, the AMAF win/visit counts from
+   * that node's player's perspective -- including moves never tried as a
+   * child, which is what lets RAVE order unexplored moves. */
   int root_color;
   int amaf_ply[BOARDMAX];
-  int amaf_color[BOARDMAX];
+  int *node_amaf_wins;
+  int *node_amaf_games;
 };
 
 
@@ -1823,7 +1824,20 @@ struct uct_tree {
  * GNUGO_RAVE is set.  Validate with regression/selfplay/ before enabling by
  * default. */
 static int rave_flag = -1;
-static float rave_equiv = 1000.0;
+static float rave_equiv = 1000.0;  /* K: visits at which UCT and RAVE weigh equally */
+static float rave_c = 0.5;         /* exploration constant for the RAVE policy */
+static float rave_fpu = 0.5;       /* first-play value for moves with no AMAF data */
+
+static void
+rave_getenv_float(const char *name, float *target)
+{
+  const char *v = getenv(name);
+  if (v && *v) {
+    double parsed = atof(v);
+    if (parsed >= 0.0)
+      *target = (float) parsed;
+  }
+}
 
 static int
 rave_enabled(void)
@@ -1832,12 +1846,11 @@ rave_enabled(void)
     const char *v = getenv("GNUGO_RAVE");
     rave_flag = (v && *v && *v != '0') ? 1 : 0;
     if (rave_flag) {
-      const char *k = getenv("GNUGO_RAVE_EQUIV");
-      if (k && *k) {
-	double parsed = atof(k);
-	if (parsed > 0.0)
-	  rave_equiv = (float) parsed;
-      }
+      rave_getenv_float("GNUGO_RAVE_EQUIV", &rave_equiv);
+      rave_getenv_float("GNUGO_RAVE_C", &rave_c);
+      rave_getenv_float("GNUGO_RAVE_FPU", &rave_fpu);
+      if (rave_equiv <= 0.0)
+	rave_equiv = 1000.0;
     }
   }
   return rave_flag;
@@ -1903,8 +1916,6 @@ uct_find_node(struct uct_tree *tree, struct uct_node *parent, int move)
     gg_assert(tree->num_used_arcs < tree->num_arcs);
     arc->move = move;
     arc->node = node;
-    arc->rave_wins = 0;
-    arc->rave_games = 0;
     if (parent->child)
       arc->next = parent->child;
     else
@@ -1970,17 +1981,17 @@ uct_finish_and_score_game(struct mc_game *game)
   return komi + mc_play_random_game(game);
 }
 
-/* Record, for the simulation just played out, the first ply and color at
- * which each intersection was played.  Iterating from the last ply back to
- * the first leaves amaf_ply[] holding the earliest (first) occurrence, which
- * is what the first-visit AMAF heuristic requires.  Colors alternate every
- * ply (passes flip the player too), so the color is determined by parity. */
+/* Record, for the simulation just played out, the first ply at which each
+ * intersection was played.  Iterating from the last ply back to the first
+ * leaves amaf_ply[] holding the earliest (first) occurrence, which is what
+ * the first-visit AMAF heuristic requires.  The player who made each move is
+ * recovered from ply parity (colors alternate every ply, passes included),
+ * so it need not be stored separately. */
 static void
 uct_build_amaf(struct uct_tree *tree)
 {
   int t;
   int n = tree->game.depth;
-  int other = OTHER_COLOR(tree->root_color);
   int pos;
 
   for (pos = BOARDMIN; pos < BOARDMAX; pos++)
@@ -1988,11 +1999,137 @@ uct_build_amaf(struct uct_tree *tree)
 
   for (t = n - 1; t >= 0; t--) {
     int m = tree->game.move_history[t];
-    if (ON_BOARD(m)) {
+    if (ON_BOARD(m))
       tree->amaf_ply[m] = t;
-      tree->amaf_color[m] = (t & 1) ? other : tree->root_color;
+  }
+}
+
+/* Is move pos an own proper small eye that a playout should not fill?
+ * Mirrors the legality/eye test used by the baseline selection policy. */
+static int
+uct_is_proper_small_eye(struct mc_board *mc, int pos, int color)
+{
+  int r;
+  for (r = 0; r < 4; r++)
+    if (mc->board[pos + delta[r]] == EMPTY
+	|| mc->board[pos + delta[r]] == OTHER_COLOR(color))
+      return 0;
+  {
+    int diagonal_value = 0;
+    for (r = 4; r < 8; r++) {
+      int pos2 = pos + delta[r];
+      if (!MC_ON_BOARD(pos2))
+	diagonal_value++;
+      else if (mc->board[pos2] == OTHER_COLOR(color))
+	diagonal_value += 2;
+    }
+    if (diagonal_value > 3)
+      return 0;
+  }
+  return 1;
+}
+
+/* Best untested (never-expanded) move at this node by its AMAF value, with
+ * first-play urgency (rave_fpu) for moves that have no AMAF data yet. Returns
+ * NO_MOVE if no untested moves remain; *value_out gets the combined score
+ * (AMAF mean plus the N=0 exploration bonus) for comparison against children. */
+static int
+uct_best_untested_move(struct uct_tree *tree, struct uct_node *node,
+		       const int *aw, const int *ag, float explore,
+		       float *value_out)
+{
+  int best_pos = NO_MOVE;
+  float best_value = -1.0;
+  int k;
+  for (k = 0; k < tree->num_ordered_moves; k++) {
+    int pos = tree->move_ordering[k];
+    float v;
+    if (!(node->untested.bits[pos / 32] & (1 << (pos % 32))))
+      continue;
+    v = (ag[pos] > 0 ? (float) aw[pos] / ag[pos] : rave_fpu) + explore;
+    if (v > best_value) {
+      best_value = v;
+      best_pos = pos;
     }
   }
+  *value_out = best_value;
+  return best_pos;
+}
+
+/* RAVE selection policy (used in place of the baseline when GNUGO_RAVE is set).
+ *
+ * Every candidate move -- existing child *and* not-yet-tried move -- is scored
+ * from this node's per-move AMAF table, so the all-moves-as-first estimates
+ * order the *unexplored* moves too (the part the baseline policy, which tries
+ * moves in a fixed static order, cannot do).  Children blend UCT and RAVE via
+ * beta = sqrt(K/(3N+K)); untested moves use their AMAF mean (beta = 1) or
+ * rave_fpu if unseen.  A uniform UCB-style bonus c*sqrt(log Ns/(N+1)) keeps
+ * exploration going (it is largest, ~c*sqrt(log Ns), for the N=0 moves). */
+static struct uct_node *
+uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
+		   float *gamma, int *move)
+{
+  struct uct_arc *child_arc;
+  int base = (int) (node - tree->nodes) * BOARDMAX;
+  const int *aw = tree->node_amaf_wins + base;
+  const int *ag = tree->node_amaf_games + base;
+  float log_node_games = node->games > 0 ? log(node->games) : 0.0;
+  float untested_explore = rave_c * sqrt(log_node_games);
+  struct mc_board *mc = &tree->game.mc;
+  int color = tree->game.color_to_move;
+  struct uct_arc *best_arc = NULL;
+  float best_value = -1.0;
+  float best_winrate = 0.0;
+  int best_pos;
+  float best_pos_value;
+
+  /* Score the existing children. */
+  for (child_arc = node->child; child_arc; child_arc = child_arc->next) {
+    struct uct_node *child_node = child_arc->node;
+    int m = child_arc->move;
+    float n = (float) child_node->games;
+    float winrate = (float) child_node->wins / n;
+    float value = winrate;
+    if (ON_BOARD(m) && ag[m] > 0) {
+      float rave = (float) aw[m] / ag[m];
+      float beta = sqrt(rave_equiv / (3.0 * n + rave_equiv));
+      value = (1.0 - beta) * winrate + beta * rave;
+    }
+    value += rave_c * sqrt(log_node_games / (n + 1.0));
+    if (value > best_value) {
+      best_value = value;
+      best_arc = child_arc;
+    }
+    if (winrate > best_winrate)
+      best_winrate = winrate;
+  }
+  *gamma = best_winrate;
+
+  /* Expand the best untested move if it outranks the best existing child.
+   * Retry on own eyes / illegal moves (their untested bit is cleared first,
+   * exactly as in the baseline policy, so they are not reconsidered). */
+  best_pos = uct_best_untested_move(tree, node, aw, ag, untested_explore,
+				    &best_pos_value);
+  while (best_pos != NO_MOVE && best_pos_value >= best_value) {
+    node->untested.bits[best_pos / 32] &= ~(1 << (best_pos % 32));
+    if (!uct_is_proper_small_eye(mc, best_pos, color)
+	&& mc_play_random_move(&tree->game, best_pos)) {
+      *move = best_pos;
+      return uct_find_node(tree, node, best_pos);
+    }
+    best_pos = uct_best_untested_move(tree, node, aw, ag, untested_explore,
+				      &best_pos_value);
+  }
+
+  if (!best_arc) {
+    mc_play_random_move(&tree->game, PASS_MOVE);
+    *move = PASS_MOVE;
+    return uct_find_node(tree, node, PASS_MOVE);
+  }
+
+  *move = best_arc->move;
+  mc_play_random_move(&tree->game, best_arc->move);
+  return best_arc->node;
 }
 
 static struct uct_node *
@@ -2006,30 +2143,23 @@ uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
   float best_uct_value = 0.0;
   float best_winrate = 0.0;
   /* log(node->games) is constant across the child loop below; compute it
-   * once instead of calling log() per child (hot inner loop). */
-  float log_node_games = log(node->games);
+   * once instead of calling log() per child (hot inner loop). Guard the
+   * root's first visit (games == 0): the value is unused when there are no
+   * children, but avoid evaluating log(0). */
+  float log_node_games = node->games > 0 ? log(node->games) : 0.0;
+
+  if (rave_enabled())
+    return uct_play_move_rave(tree, node, alpha, gamma, move);
 
   for (child_arc = node->child; child_arc; child_arc = child_arc->next) {
     struct uct_node *child_node = child_arc->node;
     float winrate = (float) child_node->wins / child_node->games;
-    float value = winrate;
     float uct_value;
     float log_games_ratio = log_node_games / child_node->games;
     float x = winrate * (1.0 - winrate) + sqrt(2.0 * log_games_ratio);
     if (x < 0.25)
       x = 0.25;
-
-    /* Blend the UCT estimate with the RAVE (all-moves-as-first) estimate.
-     * beta -> 1 when the move has few real visits but RAVE samples, and
-     * beta -> 0 as real visits accumulate, recovering plain UCT. */
-    if (rave_enabled() && child_arc->rave_games > 0) {
-      float rave_winrate = (float) child_arc->rave_wins / child_arc->rave_games;
-      float n = (float) child_node->games;
-      float beta = sqrt(rave_equiv / (3.0 * n + rave_equiv));
-      value = (1.0 - beta) * winrate + beta * rave_winrate;
-    }
-
-    uct_value = value + sqrt(2 * log_games_ratio * x / (1 + tree->game.depth));
+    uct_value = winrate + sqrt(2 * log_games_ratio * x / (1 + tree->game.depth));
     if (uct_value > best_uct_value) {
       next_arc = child_arc;
       best_uct_value = uct_value;
@@ -2141,20 +2271,28 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
   node->sum_scores += result;
   node->sum_scores2 += result * result;
 
-  /* RAVE backup: credit this simulation to every child move that the player
-   * to move at this node played later in the simulation (all-moves-as-first).
-   * rave_wins counts wins for that player, matching child->wins. */
+  /* RAVE backup (all-moves-as-first): credit this simulation to every move
+   * that the player to move at this node played later in the simulation --
+   * not just the children, so that as-yet-unexplored moves accumulate AMAF
+   * value too.  A move counts once (first-visit), for the player whose ply
+   * has the same parity as node_depth; the win is from that player's
+   * perspective, matching child->wins. */
   if (rave_enabled()) {
     int player_won = ((result > 0) == (color == WHITE));
-    struct uct_arc *arc;
-    for (arc = node->child; arc; arc = arc->next) {
-      int m = arc->move;
-      if (ON_BOARD(m) && tree->amaf_ply[m] >= node_depth
-	  && tree->amaf_color[m] == color) {
-	arc->rave_games++;
-	if (player_won)
-	  arc->rave_wins++;
-      }
+    int base = (int) (node - tree->nodes) * BOARDMAX;
+    int *aw = tree->node_amaf_wins + base;
+    int *ag = tree->node_amaf_games + base;
+    int final_depth = tree->game.depth;
+    int t;
+    for (t = node_depth; t < final_depth; t++) {
+      int m = tree->game.move_history[t];
+      if (((t ^ node_depth) & 1))	/* opponent's ply -- skip */
+	continue;
+      if (!ON_BOARD(m) || tree->amaf_ply[m] != t)  /* not first occurrence */
+	continue;
+      ag[m]++;
+      if (player_won)
+	aw[m]++;
     }
   }
 
@@ -2274,6 +2412,16 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
   tree.num_used_nodes = 0;
   tree.num_used_arcs = 0;
   tree.forbidden_moves = forbidden_moves;
+  /* Per-node AMAF tables for RAVE: one [BOARDMAX] row per node.  Allocated
+   * only when RAVE is enabled; calloc + demand paging keeps resident memory
+   * proportional to the nodes actually visited rather than the whole pool. */
+  tree.node_amaf_wins = NULL;
+  tree.node_amaf_games = NULL;
+  if (rave_enabled()) {
+    tree.node_amaf_wins = calloc((size_t) nodes * BOARDMAX, sizeof(int));
+    tree.node_amaf_games = calloc((size_t) nodes * BOARDMAX, sizeof(int));
+    gg_assert(tree.node_amaf_wins && tree.node_amaf_games);
+  }
   uct_init_node(&tree, allowed_moves);
   uct_init_move_ordering(&tree);
 
@@ -2371,6 +2519,8 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
   free(tree.arcs);
   free(tree.hashtable_odd);
   free(tree.hashtable_even);
+  free(tree.node_amaf_wins);
+  free(tree.node_amaf_games);
 }
 
 

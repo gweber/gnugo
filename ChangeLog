@@ -34,11 +34,17 @@ Playing-strength work (heuristic engine, no neural nets):
   search (montecarlo.c), after Gelly & Silver, "Monte-Carlo tree search and
   rapid action value estimation in computer Go", Artificial Intelligence 175
   (2011).  Each simulation's outcome is shared, via the all-moves-as-first
-  heuristic, with every child move the same player replayed later in the
-  playout; the AMAF estimate is blended with the UCT estimate using
-  beta = sqrt(K / (3N + K)).  Gated by GNUGO_RAVE (default off, so play is
-  byte-identical to the baseline); the equivalence constant K is tunable via
-  GNUGO_RAVE_EQUIV (default 1000)
+  heuristic, with every move the same player replayed later in the playout.
+  AMAF statistics are kept per node and per board point (not just per visited
+  child), so RAVE also orders the *unexplored* moves -- which is where most of
+  the strength comes from; for existing children the AMAF estimate is blended
+  with the UCT estimate using beta = sqrt(K / (3N + K)).  When RAVE is on, the
+  whole UCT selection policy is replaced (uct_play_move_rave); the per-node
+  AMAF tables are allocated lazily (calloc + demand paging).  Gated by
+  GNUGO_RAVE (default off, so play is byte-identical to the baseline, verified
+  across pinned seeds); tunables GNUGO_RAVE_EQUIV (K, default 1000),
+  GNUGO_RAVE_C (exploration, default 0.5), GNUGO_RAVE_FPU (first-play value,
+  default 0.5)
 - micro-optimize the UCT child-selection loop: hoist the loop-invariant
   log(node->games) out of the per-child body (numerically identical)
 - selfplay harness: add reproducible per-game seeding (twogtp.py --seed),
