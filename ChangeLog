@@ -30,6 +30,10 @@ Playing-strength work (heuristic engine, no neural nets):
 - add a df-pn (depth-first proof-number) ladder solver module (dfpn.c),
   exposed via the GTP test command dfpn_attack; sound (validated to agree
   with attack() with zero unsound results) but scoped to ladders/captures
+- add a global selective-search prototype (regression/selfplay/selective_engine.py):
+  one-ply lookahead over gnugo's own top moves scored by estimate_score;
+  measured strength-neutral at 1 ply (see SELECTIVE_SEARCH.md) -- mechanism
+  and harness kept for deeper-search follow-ups
 
 =========================================================================
 
