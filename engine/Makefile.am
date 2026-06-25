@@ -23,6 +23,7 @@ libengine_a_SOURCES = \
       boardlib.c \
       breakin.c \
       cache.c \
+      cgt_endgame.c \
       clock.c \
       combination.c \
       dfpn.c \

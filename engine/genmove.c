@@ -300,6 +300,29 @@ collect_move_reasons(int color)
   unconditional_move_reasons(color);
 }
 
+/* Opt-in gate for the exact CGT endgame ordering (see cgt_endgame.c).  Read
+ * once from the environment so the default build is byte-identical to upstream.
+ * GNUGO_CGT=1 enables it; GNUGO_CGT_MARGIN tunes how much hotter (in points) a
+ * CGT move must be than the engine's pick before it is preferred.
+ */
+static float cgt_endgame_margin = 0.01;
+
+static int
+cgt_endgame_enabled(void)
+{
+  static int cgt_flag = -1;
+  if (cgt_flag < 0) {
+    const char *v = getenv("GNUGO_CGT");
+    cgt_flag = (v && *v && *v != '0') ? 1 : 0;
+    if (cgt_flag) {
+      const char *m = getenv("GNUGO_CGT_MARGIN");
+      if (m && *m)
+	cgt_endgame_margin = (float) atof(m);
+    }
+  }
+  return cgt_flag;
+}
+
 /* Call Monte Carlo module to generate a move. */
 static int
 monte_carlo_genmove(int color, int allowed_moves[BOARDMAX],
@@ -529,7 +552,32 @@ do_genmove(int color, float pure_threat_value,
     gg_assert(stackp == 0);
     time_report(1, "endgame", NO_MOVE, 1.0);
   }
-  
+
+  /* Exact CGT endgame ordering (opt-in via GNUGO_CGT).  In the endgame regime,
+   * if combinatorial-game analysis proves a locally hotter independent move
+   * than the one the pattern/influence machinery picked, prefer it.  Sound by
+   * construction (only capture-free regions enclosed by unconditionally-alive
+   * walls are valued; everything else abstains).  Disabled by default, so
+   * standard play is unaffected.
+   */
+  if (cgt_endgame_enabled() && *value <= 6.0 && !doing_scoring) {
+    float cgt_temp = 0.0;
+    int cgt_move = cgt_endgame_move(color, &cgt_temp);
+    if (cgt_move != NO_MOVE
+	&& cgt_temp > *value + cgt_endgame_margin
+	&& (!allowed_moves || allowed_moves[cgt_move])
+	&& is_allowed_move(cgt_move, color)) {
+      TRACE("CGT endgame prefers %1m (temperature %f) over %1m (value %f)\n",
+	    cgt_move, cgt_temp, move, *value);
+      move = cgt_move;
+      *value = cgt_temp;
+      record_top_move(move, *value);
+      move_considered(move, *value);
+    }
+    gg_assert(stackp == 0);
+    time_report(1, "cgt endgame", NO_MOVE, 1.0);
+  }
+
   /* If no move found yet, revisit any semeai and change the
    * status of the opponent group from DEAD to UNKNOWN, then 
    * run shapes and endgame_shapes again. This may turn up a move.

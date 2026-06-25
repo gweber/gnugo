@@ -441,6 +441,7 @@ int owl_strong_dragon(int pos);
 void owl_reasons(int color);
 
 void unconditional_life(int unconditional_territory[BOARDMAX], int color);
+int cgt_endgame_move(int color, float *temperature);
 void clear_unconditionally_meaningless_moves(void);
 void find_unconditionally_meaningless_moves(int unconditional_territory[BOARDMAX],
 					    int color);
