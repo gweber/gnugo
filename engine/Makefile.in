@@ -56,6 +56,7 @@ libengine_a_AR = $(AR) $(ARFLAGS)
 libengine_a_LIBADD =
 am_libengine_a_OBJECTS = aftermath.$(OBJEXT) board.$(OBJEXT) \
 	boardlib.$(OBJEXT) breakin.$(OBJEXT) cache.$(OBJEXT) \
+	cgt_endgame.$(OBJEXT) \
 	clock.$(OBJEXT) combination.$(OBJEXT) dfpn.$(OBJEXT) \
 	dragon.$(OBJEXT) \
 	endgame.$(OBJEXT) filllib.$(OBJEXT) fuseki.$(OBJEXT) \
@@ -198,6 +199,7 @@ libengine_a_SOURCES = \
       boardlib.c \
       breakin.c \
       cache.c \
+      cgt_endgame.c \
       clock.c \
       combination.c \
       dfpn.c \
@@ -296,6 +298,7 @@ distclean-compile:
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/boardlib.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/breakin.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/cache.Po@am__quote@
+@AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/cgt_endgame.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/clock.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/combination.Po@am__quote@
 @AMDEP_TRUE@@am__include@ @am__quote@./$(DEPDIR)/dfpn.Po@am__quote@
