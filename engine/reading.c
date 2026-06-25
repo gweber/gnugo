@@ -245,9 +245,9 @@ static void special_rescue3_moves(int str, int libs[3],
 				  struct reading_moves *moves);
 static void special_rescue4_moves(int str, int libs[2],
 				  struct reading_moves *moves);
-static void hane_rescue_moves(int str, int libs[4],
+static void hane_rescue_moves(int str, int libs[],
 			      struct reading_moves *moves);
-static void special_rescue5_moves(int str, int libs[3],
+static void special_rescue5_moves(int str, int libs[],
     				  struct reading_moves *moves);
 static void special_rescue6_moves(int str, int libs[3],
     				  struct reading_moves *moves);
@@ -2191,7 +2191,7 @@ special_rescue4_moves(int str, int libs[2], struct reading_moves *moves)
  * and as the newly placed stone at c.
  */
 static void
-hane_rescue_moves(int str, int libs[4], struct reading_moves *moves)
+hane_rescue_moves(int str, int libs[], struct reading_moves *moves)
 {
   int color = board[str];
   int other = OTHER_COLOR(color);
@@ -2265,7 +2265,7 @@ hane_rescue_moves(int str, int libs[4], struct reading_moves *moves)
  * returns moves which are potentially useful in these positions.
  */
 static void
-special_rescue5_moves(int str, int libs[3],
+special_rescue5_moves(int str, int libs[],
                       struct reading_moves *moves)
 {
   int color = board[str];

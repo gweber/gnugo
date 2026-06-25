@@ -31,9 +31,15 @@
 #endif
 
 
-#define USE_WINDOWS_SOCKET_CLUDGE		\
-  ((defined(_WIN32) || defined(_WIN32_WCE))	\
-   && defined(ENABLE_SOCKET_SUPPORT))
+/* Compute this as a plain 0/1 object-like macro rather than hiding
+ * `defined` inside a macro body.  Per the C standard the result of
+ * `defined` is undefined when it comes from a macro expansion, and
+ * modern preprocessors warn about it (-Wexpansion-to-defined). */
+#if (defined(_WIN32) || defined(_WIN32_WCE)) && defined(ENABLE_SOCKET_SUPPORT)
+#define USE_WINDOWS_SOCKET_CLUDGE 1
+#else
+#define USE_WINDOWS_SOCKET_CLUDGE 0
+#endif
 
 
 #if USE_WINDOWS_SOCKET_CLUDGE

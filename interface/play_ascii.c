@@ -892,7 +892,8 @@ do_play_ascii(Gameinfo *gameinfo)
 
 	case COMMENT:
 	  printf("\nEnter comment. Press ENTER when ready.\n");
-	  fgets(line, 80, stdin);
+	  if (!fgets(line, 80, stdin))
+	    line[0] = '\0';
 	  sgftreeAddComment(&sgftree, line);
 	  break;
 

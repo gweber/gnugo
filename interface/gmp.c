@@ -502,7 +502,9 @@ static void  putCommand(Gmp *ge, Command cmd, int val)  {
     else
       fprintf(stderr, "GMP: Sending command: %s\n", commandNames[cmd]);
   }
-  write(ge->outFile, ge->sendData, 4);
+  if (write(ge->outFile, ge->sendData, 4) != 4) {
+    /* GMP retransmits on a missing ack, so a short write is recovered. */
+  }
   ge->waitingHighAck = (cmd != cmd_ack);
   return;
 }
@@ -734,7 +736,9 @@ static int  heartbeat(Gmp *ge)  {
 	      fprintf(stderr, "GMP: Sending command: %s (retry)\n",
 		      commandNames[cmd]);
 	}
-	write(ge->outFile, ge->sendData, 4);
+	if (write(ge->outFile, ge->sendData, 4) != 4) {
+	  /* GMP retransmits on a missing ack, so a short write is recovered. */
+	}
       }
     }
   }
