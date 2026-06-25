@@ -151,6 +151,10 @@ int number_close_white_worms[BOARDMAX];
 int false_eye_territory[BOARDMAX];
 int forced_backfilling_moves[BOARDMAX];
 
+/* Unconditionally meaningless moves (see unconditional.c). */
+int meaningless_black_moves[BOARDMAX];
+int meaningless_white_moves[BOARDMAX];
+
 struct worm_data      worm[BOARDMAX];
 struct dragon_data    dragon[BOARDMAX];
 int                   number_of_dragons;
