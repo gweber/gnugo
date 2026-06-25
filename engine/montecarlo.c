@@ -1918,6 +1918,25 @@ grave_enabled(void)
   return grave_flag && rave_enabled();
 }
 
+/* Adaptive low-pass ("bandpass") on child value estimates: shrink each child's
+ * win rate toward 0.5 by `s` pseudo-counts, so low-visit (high-variance)
+ * children are regularized while converged ones keep their estimate -- a
+ * visit-count-dependent noise filter (Bayesian / James-Stein shrinkage).
+ * Strength via GNUGO_MC_SHRINK (default 0 = off, behavior unchanged). */
+static float mc_shrink_strength = -1.0;
+
+static float
+mc_value_shrink(void)
+{
+  if (mc_shrink_strength < 0.0) {
+    const char *v = getenv("GNUGO_MC_SHRINK");
+    mc_shrink_strength = (v && *v) ? (float) atof(v) : 0.0;
+    if (mc_shrink_strength < 0.0)
+      mc_shrink_strength = 0.0;
+  }
+  return mc_shrink_strength;
+}
+
 
 static struct uct_node *
 uct_init_node(struct uct_tree *tree, int *allowed_moves)
@@ -2150,13 +2169,16 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
   float best_winrate = 0.0;
   int best_pos;
   float best_pos_value;
+  float shrink = mc_value_shrink();
 
   /* Score the existing children. */
   for (child_arc = node->child; child_arc; child_arc = child_arc->next) {
     struct uct_node *child_node = child_arc->node;
     int m = child_arc->move;
     float n = (float) child_node->games;
-    float winrate = (float) child_node->wins / n;
+    float winrate = shrink > 0.0
+		    ? (child_node->wins + 0.5 * shrink) / (n + shrink)
+		    : (float) child_node->wins / n;
     float value = winrate;
     if (ON_BOARD(m) && ag[m] > 0) {
       float rave = (float) aw[m] / ag[m];
