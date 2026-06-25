@@ -2,6 +2,36 @@
 -- ChangeLog
 -------------------------------------------------------------------------
 
+=== Modernization & strength fork (2026, based on 3.9.1 / upstream 84a32e9c) ===
+
+Modernization (build & correctness on current toolchains):
+- fix build with modern GCC/Clang (-fno-common): declare
+  meaningless_black_moves[]/meaningless_white_moves[] extern in liberty.h
+  with a single definition in globals.c
+- fix latent logic bug in owl pattern VA32 (owl_vital_apats.db): the
+  constraint "!oplay_attack(*,?,b,*)==WIN" was always false due to operator
+  precedence; rewritten to "...!=WIN"
+- fix partial-array memset in breakin.c (used sizeof element count)
+- check fgets/fread/write return values (play_ascii.c, main.c, gmp.c);
+  the play_ascii.c case fixed an uninitialized comment buffer on EOF
+- pass data strings through "%s" formats (dfa.c, uncompress_fuseki.c,
+  mkpat.c); compute USE_WINDOWS_SOCKET_CLUDGE as a 0/1 macro instead of
+  hiding "defined" in a macro body; reduced warnings 162 -> 13 on GCC 13
+- add GitHub Actions CI (GCC + Clang build, regression smoke tests)
+
+Playing-strength work (heuristic engine, no neural nets):
+- add a dependency-free self-play Elo harness (regression/selfplay/) and an
+  SPSA parameter tuner
+- expose strength-critical weights as runtime tunables via GNUGO_* env vars
+  (params.h): move-valuation weight scales, shape factor base, lunch
+  multiplier; defaults reproduce historical behavior exactly
+- add an experimental history heuristic for tactical-reading move ordering
+  in reading.c (GNUGO_HISTORY_HEURISTIC, default off)
+- add a df-pn (depth-first proof-number) capture solver module (dfpn.c),
+  exposed via the GTP test command dfpn_attack
+
+=========================================================================
+
 - change pieces to stones in board output in ascii mode
 - copyright notices updated for 2011
 - removed tactical semeai reading, avoiding a crash
