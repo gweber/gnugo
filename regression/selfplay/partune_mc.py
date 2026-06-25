@@ -24,12 +24,14 @@ from parmatch import parallel_match
 # values; the two *_P knobs are the Moggy-style fire-probabilities for the
 # tactical override rules (atari-response, LGRF) -- start at 0 (off) so SPSA
 # discovers whether a *dose* of them helps, given the constants can co-adapt.
+# Final pass: centered on the current best (equiv=100/c=0.26/fpu=0.64), ranges
+# tightened around the discovered optimum; dose knobs dropped (they tuned to
+# ~0); shrink kept as a free co-tunable.
 PARAMS = {
-    "GNUGO_RAVE_EQUIV":  (530.0, 100.0, 4000.0),
-    "GNUGO_RAVE_C":      (0.41, 0.05, 1.5),
-    "GNUGO_RAVE_FPU":    (0.57, 0.1, 1.2),
-    "GNUGO_MC_ATARI_P":  (0.0, 0.0, 1.0),
-    "GNUGO_MC_LGRF_P":   (0.0, 0.0, 1.0),
+    "GNUGO_RAVE_EQUIV":  (100.0, 30.0, 300.0),
+    "GNUGO_RAVE_C":      (0.26, 0.10, 0.60),
+    "GNUGO_RAVE_FPU":    (0.64, 0.30, 1.10),
+    "GNUGO_MC_SHRINK":   (0.0, 0.0, 1.0),
 }
 
 

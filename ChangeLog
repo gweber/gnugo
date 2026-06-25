@@ -47,7 +47,13 @@ Playing-strength work (heuristic engine, no neural nets):
   equiv means RAVE hands off to UCT quickly (AMAF used mainly to order
   unexplored moves). With this, the MC stack beats classical GNU Go by
   +37 +/- 34 Elo at *equal compute* (classical level 10), up from a marginal
-  +24 before tuning -- i.e. a real edge, not just bought with CPU.
+  +24 before tuning -- i.e. a real edge, not just bought with CPU. A third
+  thorough SPSA pass (1500 games) centered on the optimum converged back to
+  ~equiv=111/c=0.28/fpu=0.62 and validated +7 +/- 28 vs the adopted values,
+  confirming the RAVE constants are now at their optimum (tuning exhausted;
+  clean round-number defaults kept). The remaining big heuristic lever is the
+  ~283k-entry playout pattern-value table, which needs *fitting* (simulation
+  balancing / Bradley-Terry MM), not SPSA -- a separate learning pipeline.
 - evaluated two more Moggy/Fuego playout rules, gated with a tunable fire
   PROBABILITY (Moggy-style dosing): LGRF / Last-Good-Reply (GNUGO_MC_LGRF_P)
   and atari-response (GNUGO_MC_ATARI_P). At full strength both HURT
