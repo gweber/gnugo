@@ -64,6 +64,17 @@ Playing-strength work (heuristic engine, no neural nets):
   selection-side -- a category uniformly neutral/negative for this engine --
   and its gains need a policy net) and quasi-Monte-Carlo / control-variate
   playouts (do not map cleanly to adaptive sequential MCTS sampling).
+- add a mercy rule to the playout (MoGo/Pachi/CrazyStone throughput idea;
+  GNUGO_MC_MERCY, default 0 = off): abort a playout once one side leads by N
+  stones. A first attempt scored mid-playout by territory-adjacency, which is
+  meaningless on a sparse board (isolated empties all default to one color) --
+  it fired spuriously, "sped up" 65% but lost -113 Elo (caught by SPRT in 368
+  games). Re-done with an unbiased stone-count balance it is honest but only
+  +7-14% faster on 9x9 and ~-9 +/- 18 Elo at fixed sims, i.e. roughly
+  break-even at fixed time: GNU Go's *random* playouts rarely become
+  stone-decisive early. Kept flag-off, retained for 19x19 (where playouts are
+  ~4x longer). Also: -O3 -mcpu=native gives ~+5%; single-thread is otherwise
+  near-optimal, so the real throughput lever is parallelism.
 - evaluated two more Moggy/Fuego playout rules, gated with a tunable fire
   PROBABILITY (Moggy-style dosing): LGRF / Last-Good-Reply (GNUGO_MC_LGRF_P)
   and atari-response (GNUGO_MC_ATARI_P). At full strength both HURT

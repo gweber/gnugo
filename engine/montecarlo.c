@@ -1831,22 +1831,15 @@ static int mc_play_random_move(struct mc_game *game, int move)
   return result;
 }
 
-static int mc_play_random_game(struct mc_game *game)
+/* Score the current playout position from White's perspective: +1 per White
+ * point, -1 per Black point (unsettled empties go to the adjacent color). */
+static int
+mc_score_game(struct mc_game *game)
 {
   struct mc_board *mc = &game->mc;
-  
   int score = 0;
   int pos;
   int k;
-  int result;
-  int move;
-
-  /* First finish the game, if it isn't already. */
-  while (game->consecutive_passes < 3) {
-    move = mc_generate_random_move(game);
-    result = mc_play_random_move(game, move);
-    ASSERT1(result, move);
-  }
 
   for (pos = BOARDMIN; pos < BOARDMAX; pos++)
     if (MC_ON_BOARD(pos)) {
@@ -1862,12 +1855,72 @@ static int mc_play_random_game(struct mc_game *game)
 	    if (IS_STONE(mc->board[pos2]))
 	      break;
 	  }
-	
+
 	score += 2 * (mc->board[pos2] == WHITE) - 1;
       }
     }
 
   return score;
+}
+
+/* Mercy rule (MoGo/Pachi/CrazyStone): abort a lopsided playout as soon as one
+ * side leads by GNUGO_MC_MERCY points and score it as is. Most random playouts
+ * become decided long before the board fills, so this cuts the average playout
+ * length -> more simulations per second, at negligible strength cost (the lead
+ * is real). Default 0 = off (play to the end). */
+static int
+mc_mercy_margin(void)
+{
+  static int margin = -1;
+  if (margin < 0) {
+    const char *v = getenv("GNUGO_MC_MERCY");
+    margin = (v && *v) ? atoi(v) : 0;
+    if (margin < 0)
+      margin = 0;
+  }
+  return margin;
+}
+
+/* Unbiased decisiveness signal for the mercy rule: stones on board,
+ * White - Black. (mc_score_game's territory-by-adjacency is meaningless on a
+ * sparse mid-playout board -- isolated empties all default to one color.) */
+static int
+mc_stone_balance(struct mc_board *mc)
+{
+  int pos;
+  int bal = 0;
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
+    if (mc->board[pos] == WHITE)
+      bal++;
+    else if (mc->board[pos] == BLACK)
+      bal--;
+  }
+  return bal;
+}
+
+static int mc_play_random_game(struct mc_game *game)
+{
+  int result;
+  int move;
+  int mercy = mc_mercy_margin();
+  int since_check = 0;
+
+  /* First finish the game, if it isn't already. */
+  while (game->consecutive_passes < 3) {
+    move = mc_generate_random_move(game);
+    result = mc_play_random_move(game, move);
+    ASSERT1(result, move);
+    /* Mercy rule: stop once one side leads by `mercy` stones (a real,
+     * capture-driven lead), scoring by that lead's sign. Checked periodically. */
+    if (mercy > 0 && ++since_check >= 24) {
+      int bal = mc_stone_balance(&game->mc);
+      if (bal >= mercy || bal <= -mercy)
+	return bal;
+      since_check = 0;
+    }
+  }
+
+  return mc_score_game(game);
 }
 
 /******************* UCT search ***********************/
