@@ -54,6 +54,16 @@ Playing-strength work (heuristic engine, no neural nets):
   clean round-number defaults kept). The remaining big heuristic lever is the
   ~283k-entry playout pattern-value table, which needs *fitting* (simulation
   balancing / Bradley-Terry MM), not SPSA -- a separate learning pipeline.
+- cross-domain workflow tooling (sister fields optimizing what we do): add
+  SPRT early-stopping A/B with common random numbers (sprt.py; from
+  chess-engine testing + OR variance reduction) and a Successive-Halving
+  tuner (asha.py; from AutoML). These cut the games/compute every future
+  experiment needs (SPRT decided a known ~+90 Elo gap in 224 games; ASHA
+  recovered the RAVE optimum region from random samples). Assessed but NOT
+  implemented, with rationale: Sequential-Halving root selection (invasive,
+  selection-side -- a category uniformly neutral/negative for this engine --
+  and its gains need a policy net) and quasi-Monte-Carlo / control-variate
+  playouts (do not map cleanly to adaptive sequential MCTS sampling).
 - evaluated two more Moggy/Fuego playout rules, gated with a tunable fire
   PROBABILITY (Moggy-style dosing): LGRF / Last-Good-Reply (GNUGO_MC_LGRF_P)
   and atari-response (GNUGO_MC_ATARI_P). At full strength both HURT
