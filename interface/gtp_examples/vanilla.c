@@ -101,7 +101,7 @@ main()
       while (length != 1) {
 	ASK_GNUGO(gnugo_line);
 	length = strlen(gnugo_line);
-	printf(gnugo_line);
+	printf("%s", gnugo_line);
 	fflush(stdout);
       }
     }
@@ -110,7 +110,7 @@ main()
       while (length != 1) {
 	ASK_GNUGO(gnugo_line);
 	length = strlen(gnugo_line);
-	printf(gnugo_line);
+	printf("%s", gnugo_line);
 	fflush(stdout);
       }
     }
