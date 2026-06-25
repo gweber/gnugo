@@ -29,17 +29,51 @@
 #include "sgftree.h"
 #include "liberty.h"
 #include "clock.h"
+#include "params.h"
 
 #include "gg_utils.h"
 
+#include <stdlib.h>
+
+/* Override one float parameter from environment variable `name`, if set. */
+static void
+getenv_float(const char *name, float *dst)
+{
+  const char *v = getenv(name);
+  if (v && *v) {
+    char *end;
+    double d = strtod(v, &end);
+    if (end != v)
+      *dst = (float) d;
+  }
+}
+
+/* Populate the tunable strength parameters from GNUGO_* environment
+ * variables. Unset variables leave the historical defaults in place, so
+ * ordinary play is unaffected. Intended for automated tuning via self-play
+ * (see regression/selfplay/). */
+void
+load_tunable_params(void)
+{
+  getenv_float("GNUGO_TERRITORIAL_WEIGHT",   &tunable.territorial_weight_scale);
+  getenv_float("GNUGO_STRATEGICAL_WEIGHT",   &tunable.strategical_weight_scale);
+  getenv_float("GNUGO_ATTACK_DRAGON_WEIGHT", &tunable.attack_dragon_weight_scale);
+  getenv_float("GNUGO_FOLLOWUP_WEIGHT",      &tunable.followup_weight_scale);
+  getenv_float("GNUGO_INVASION_MALUS_WEIGHT", &tunable.invasion_malus_weight_scale);
+  getenv_float("GNUGO_SHAPE_FACTOR_BASE",    &tunable.shape_factor_base);
+  getenv_float("GNUGO_LUNCH_MULTIPLIER",     &tunable.lunch_weakness_multiplier);
+}
+
 /*
- * Initialize the gnugo engine. This needs to be called 
+ * Initialize the gnugo engine. This needs to be called
  * once only.
  */
 
 void
 init_gnugo(float memory, unsigned int seed)
 {
+  load_tunable_params();
+
   /* We need a fixed seed when initializing the Zobrist hashing to get
    * reproducable results.
    * FIXME: Test the quality of the seed.

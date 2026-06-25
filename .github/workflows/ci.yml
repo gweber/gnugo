@@ -1,0 +1,58 @@
+name: CI
+
+# Build GNU Go on a modern toolchain and run a small regression smoke test
+# on every push and pull request.
+
+on:
+  push:
+    branches: [master, modernize]
+  pull_request:
+
+jobs:
+  build:
+    name: Build & smoke test (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential ${{ matrix.cc }}
+
+      - name: Configure
+        run: ./configure
+
+      - name: Build
+        run: make -j"$(nproc)"
+
+      - name: Version smoke test
+        run: ./interface/gnugo --version
+
+      - name: GTP smoke test
+        run: |
+          printf 'boardsize 9\nclear_board\nplay black D4\ngenmove white\nshowboard\nquit\n' \
+            | ./interface/gnugo --mode gtp
+
+      - name: Regression smoke test (owl life & death)
+        working-directory: regression
+        run: |
+          set -e
+          status=0
+          for t in owl owl1 ld_owl capture; do
+            out=$(../interface/gnugo --quiet --mode gtp < "$t.tst" \
+                  | awk -f regress.awk tst="$t.tst")
+            bad=$(printf '%s\n' "$out" | grep -ci 'unexpected\|crash' || true)
+            echo "$t.tst: unexpected/crash lines = $bad"
+            if [ "$bad" -ne 0 ]; then
+              printf '%s\n' "$out" | grep -i 'unexpected\|crash'
+              status=1
+            fi
+          done
+          exit $status

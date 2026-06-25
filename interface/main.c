@@ -1872,9 +1872,10 @@ socket_stop_listening(FILE *input_file, FILE *output_file)
   /* When listening, we wait for the client to disconnect first.
    * Otherwise, socket doesn't get released properly.
    */
-  do
-    fread(buffer, sizeof buffer, 1, input_file);
-  while (!feof(input_file));
+  do {
+    if (fread(buffer, sizeof buffer, 1, input_file) < 1)
+      break;
+  } while (!feof(input_file));
 
   fclose(input_file);
   fclose(output_file);

@@ -31,6 +31,7 @@
 #include "liberty.h"
 #include "gg_utils.h"
 #include "move_reasons.h"
+#include "params.h"
 
 
 /* Count how many distinct strings are (solidly) connected by the move
@@ -1527,7 +1528,7 @@ compute_shape_factor(int pos)
     exponent += move[pos].numpos_shape - 1;
   if (move[pos].numneg_shape > 1)
     exponent -= move[pos].numneg_shape - 1;
-  return pow(1.05, exponent);
+  return pow(tunable.shape_factor_base, exponent);
 }
 
 
@@ -2634,7 +2635,8 @@ estimate_strategical_value(int pos, int color, float our_score,
 	     * alone is not enough. The question is whether the dragon is
 	     * threatened or defended by the move or not.  
 	     */
-	    this_value = 1.8 * soft_cap(DRAGON2(bb).strategic_size, 15.0)
+	    this_value = tunable.lunch_weakness_multiplier
+			 * soft_cap(DRAGON2(bb).strategic_size, 15.0)
 			 * dragon_weakness(bb, 0);
 
 	    /* If this dragon consists of only one worm and that worm
@@ -2857,7 +2859,8 @@ estimate_strategical_value(int pos, int color, float our_score,
 	    && thrashing_stone[aa])
 	  this_value = 1.7 * DRAGON2(aa).strategic_size;
 	else
-	  this_value = 1.8 * soft_cap(DRAGON2(aa).strategic_size, 15.0)
+	  this_value = tunable.lunch_weakness_multiplier
+		       * soft_cap(DRAGON2(aa).strategic_size, 15.0)
 		       * dragon_weakness(aa, 1);
 
 	/* No strategical attack value is awarded if the dragon at (aa)
@@ -3884,10 +3887,19 @@ choose_strategy(int color, float our_score, float game_status)
       if (game_status > 0.75 && our_score < -25.0)
         invasion_malus_weight = 0.2;
             
-      TRACE("  %s is not winning enough, using aggressive settings.\n", 
+      TRACE("  %s is not winning enough, using aggressive settings.\n",
 	    color == WHITE ? "White" : "Black");
     }
   }
+
+  /* Apply tunable scale factors. Defaults are 1.0, so behavior is unchanged
+   * unless overridden via GNUGO_* env vars (see params.h). These are the
+   * primary knobs for automated tuning by self-play. */
+  territorial_weight    *= tunable.territorial_weight_scale;
+  strategical_weight    *= tunable.strategical_weight_scale;
+  attack_dragon_weight  *= tunable.attack_dragon_weight_scale;
+  followup_weight       *= tunable.followup_weight_scale;
+  invasion_malus_weight *= tunable.invasion_malus_weight_scale;
 }
 
 /* In order to get valid influence data after a move, we need to rerun

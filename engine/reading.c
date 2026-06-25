@@ -97,6 +97,7 @@
     	             trace_message)					\
   do {									\
     if (code == 0) {							\
+      record_reading_cutoff(move_pos);					\
       if (move_ptr)							\
 	*(move_ptr) = (move_pos);					\
       SGFTRACE(move_pos, WIN, trace_message);				\
@@ -245,9 +246,9 @@ static void special_rescue3_moves(int str, int libs[3],
 				  struct reading_moves *moves);
 static void special_rescue4_moves(int str, int libs[2],
 				  struct reading_moves *moves);
-static void hane_rescue_moves(int str, int libs[4],
+static void hane_rescue_moves(int str, int libs[],
 			      struct reading_moves *moves);
-static void special_rescue5_moves(int str, int libs[3],
+static void special_rescue5_moves(int str, int libs[],
     				  struct reading_moves *moves);
 static void special_rescue6_moves(int str, int libs[3],
     				  struct reading_moves *moves);
@@ -307,6 +308,40 @@ static int in_list(int move, int num_moves, int *moves);
 /* Statistics. */
 static int reading_node_counter = 0;
 static int nodes_when_called = 0;
+
+/* Experimental history heuristic for tactical-reading move ordering.
+ *
+ * A move that produces a cutoff (refutes the opponent) in CHECK_RESULT
+ * accumulates credit here; order_moves() then biases the search to try
+ * historically-successful moves earlier, which in a depth/node-bounded
+ * search like this one can find refutations sooner and read deeper within
+ * the same budget.
+ *
+ * Disabled by default (set GNUGO_HISTORY_HEURISTIC=1 to enable). When off,
+ * tactical reading is byte-identical to before. Needs self-play validation
+ * (regression/selfplay/) before it could responsibly become a default. */
+static int reading_history[BOARDMAX];
+static int history_heuristic_flag = -1;  /* -1 unset, 0 off, 1 on */
+
+static int
+reading_history_enabled(void)
+{
+  if (history_heuristic_flag < 0) {
+    const char *v = getenv("GNUGO_HISTORY_HEURISTIC");
+    history_heuristic_flag = (v && *v && *v != '0') ? 1 : 0;
+  }
+  return history_heuristic_flag;
+}
+
+/* Reward a move that produced a cutoff. Capped to avoid overflow over long
+ * sessions; the ordering bonus in order_moves() is capped separately. */
+static void
+record_reading_cutoff(int move)
+{
+  if (reading_history_enabled() && ON_BOARD(move)
+      && reading_history[move] < (1 << 20))
+    reading_history[move]++;
+}
 
  
 
@@ -2191,7 +2226,7 @@ special_rescue4_moves(int str, int libs[2], struct reading_moves *moves)
  * and as the newly placed stone at c.
  */
 static void
-hane_rescue_moves(int str, int libs[4], struct reading_moves *moves)
+hane_rescue_moves(int str, int libs[], struct reading_moves *moves)
 {
   int color = board[str];
   int other = OTHER_COLOR(color);
@@ -2265,7 +2300,7 @@ hane_rescue_moves(int str, int libs[4], struct reading_moves *moves)
  * returns moves which are potentially useful in these positions.
  */
 static void
-special_rescue5_moves(int str, int libs[3],
+special_rescue5_moves(int str, int libs[],
                       struct reading_moves *moves)
 {
   int color = board[str];
@@ -5143,7 +5178,12 @@ order_moves(int str, struct reading_moves *moves, int color,
       gprintf("%o %1m values: %d %d %d %d %d %d %d %d\n", move, number_edges,
 	      number_same_string, number_own, number_opponent, captured_stones,
 	      threatened_stones, saved_stones, number_open);
-    
+
+    /* History-heuristic ordering bonus (off by default). Capped so it only
+     * nudges/breaks ties rather than overriding the tactical scoring below. */
+    if (reading_history_enabled())
+      moves->score[r] += gg_min(reading_history[move], 8);
+
     /* Different score strategies depending on whether the move is
      * attacking or defending the string.
      */
