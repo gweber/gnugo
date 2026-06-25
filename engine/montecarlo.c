@@ -505,8 +505,8 @@ mc_countstones(struct mc_board *mc, int str, int maxstones)
   ((mc->local_context[pos] >> (21 + color)) & 1)
 
 
-#if !TURN_OFF_ASSERTIONS
-/* Is a move at pos by color legal? */
+/* Is a move at pos by color legal? (Always compiled: also used by the LGRF
+ * playout policy, not only by assertions.) */
 static int
 mc_is_legal(struct mc_board *mc, int pos, int color)
 {
@@ -525,7 +525,6 @@ mc_is_legal(struct mc_board *mc, int pos, int color)
 
   return !mc_is_suicide(mc, pos, color);
 }
-#endif
 
 
 /* Is the string at str in atari? Always place one liberty of the
@@ -1547,6 +1546,43 @@ mc_avoid_self_atari_enabled(void)
 }
 
 
+/* Last-Good-Reply with Forgetting (LGRF; Drake 2009, Baier & Drake 2010):
+ * an adaptive playout policy. mc_lgr_reply[color][prev_move] stores the move
+ * that, in a recent winning playout, that color played as a reply to
+ * prev_move; the playout plays it first when available. After each playout
+ * the winner's replies are reinforced and the loser's are forgotten. Indexed
+ * by (color == WHITE). 0 (= NO_MOVE/PASS) means "no stored reply". Gated by
+ * GNUGO_MC_LGRF (default off). The table is reset per genmove. */
+static int mc_lgr_reply[2][BOARDMAX];
+static int mc_lgrf_flag = -1;
+
+static int
+lgrf_enabled(void)
+{
+  if (mc_lgrf_flag < 0) {
+    const char *v = getenv("GNUGO_MC_LGRF");
+    mc_lgrf_flag = (v && *v && *v != '0') ? 1 : 0;
+  }
+  return mc_lgrf_flag;
+}
+
+/* Atari response (Moggy/Fuego light-playout rule): when the opponent's last
+ * move puts one of our strings in atari, save it by playing its remaining
+ * liberty -- unless that is a useless self-atari that captures nothing.
+ * Gated by GNUGO_MC_ATARI (default off). */
+static int mc_atari_flag = -1;
+
+static int
+mc_atari_response_enabled(void)
+{
+  if (mc_atari_flag < 0) {
+    const char *v = getenv("GNUGO_MC_ATARI");
+    mc_atari_flag = (v && *v && *v != '0') ? 1 : 0;
+  }
+  return mc_atari_flag;
+}
+
+
 /* Generate a random move. */
 static int
 mc_generate_random_move(struct mc_game *game)
@@ -1595,6 +1631,45 @@ mc_generate_random_move(struct mc_game *game)
 	}
     }
     return PASS_MOVE;
+  }
+
+  /* LGRF: if we have a stored good reply to the opponent's last move and it
+   * is still a legal, empty point, play it instead of sampling. */
+  if (lgrf_enabled() && last_move != PASS_MOVE && ON_BOARD(last_move)) {
+    int reply = mc_lgr_reply[color == WHITE][last_move];
+    if (reply != PASS_MOVE && ON_BOARD(reply) && mc->board[reply] == EMPTY
+	&& mc_is_legal(mc, reply, color))
+      return reply;
+  }
+
+  /* Atari response: if the opponent's last move put one of our adjacent
+   * strings in atari, save it by playing its remaining liberty, unless that
+   * is a useless self-atari that captures nothing. Play a random one. */
+  if (mc_atari_response_enabled() && last_move != PASS_MOVE
+      && ON_BOARD(last_move)) {
+    int saves[4];
+    int nsaves = 0;
+    int j;
+    for (j = 0; j < 4; j++) {
+      int nb = last_move + delta[j];
+      int lib;
+      if (mc->board[nb] == color && mc_is_in_atari(mc, nb, &lib)
+	  && ON_BOARD(lib) && mc->board[lib] == EMPTY
+	  && mc_is_legal(mc, lib, color)
+	  && (mc_stones_in_atari(mc, lib, color, 1) > 0
+	      || !mc_is_self_atari(mc, lib, color))) {
+	int t, dup = 0;
+	for (t = 0; t < nsaves; t++)
+	  if (saves[t] == lib) {
+	    dup = 1;
+	    break;
+	  }
+	if (!dup)
+	  saves[nsaves++] = lib;
+      }
+    }
+    if (nsaves > 0)
+      return saves[(int) (gg_drand() * nsaves)];
   }
 
   if (color == WHITE) {
@@ -1855,9 +1930,9 @@ struct uct_tree {
  * GNUGO_RAVE is set.  Validate with regression/selfplay/ before enabling by
  * default. */
 static int rave_flag = -1;
-static float rave_equiv = 1000.0;  /* K: visits at which UCT and RAVE weigh equally */
-static float rave_c = 0.5;         /* exploration constant for the RAVE policy */
-static float rave_fpu = 0.5;       /* first-play value for moves with no AMAF data */
+static float rave_equiv = 530.0;  /* K (joint-tuned; was 1000) */
+static float rave_c = 0.41;        /* exploration (joint-tuned; was 0.5) */
+static float rave_fpu = 0.57;      /* first-play value (joint-tuned; was 0.5) */
 
 static void
 rave_getenv_float(const char *name, float *target)
@@ -2060,6 +2135,29 @@ static float
 uct_finish_and_score_game(struct mc_game *game)
 {
   return komi + mc_play_random_game(game);
+}
+
+/* LGRF update for a finished playout (result = komi + score, >0 favors
+ * White): reinforce the winning side's (prev_move -> reply) pairs and forget
+ * the losing side's. Move colors alternate by ply parity from the root. */
+static void
+lgrf_update(struct uct_tree *tree, float result)
+{
+  int winner = (result > 0.0) ? WHITE : BLACK;
+  int depth = tree->game.depth;
+  int root = tree->root_color;
+  int i;
+  for (i = 1; i < depth; i++) {
+    int prev = tree->game.move_history[i - 1];
+    int mv = tree->game.move_history[i];
+    int c = ((i % 2) == 0) ? root : OTHER_COLOR(root);
+    if (prev == PASS_MOVE || mv == PASS_MOVE || !ON_BOARD(mv))
+      continue;
+    if (c == winner)
+      mc_lgr_reply[c == WHITE][prev] = mv;
+    else
+      mc_lgr_reply[c == WHITE][prev] = PASS_MOVE;   /* forget */
+  }
 }
 
 /* Record, for the simulation just played out, the first ply at which each
@@ -2345,6 +2443,8 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
   if (num_passes == 3 || tree->game.depth >= UCT_MAX_SEARCH_DEPTH
       || (node->games == 0 && node != tree->nodes)) {
     result = uct_finish_and_score_game(&tree->game);
+    if (lgrf_enabled())
+      lgrf_update(tree, result);
     /* The game is now played out to the end; capture the AMAF map once so
      * that every node on the way back up can reuse it for RAVE updates. */
     if (rave_enabled())
@@ -2494,6 +2594,8 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
 
   tree.game = starting_position;
   tree.root_color = color;
+  if (lgrf_enabled())
+    memset(mc_lgr_reply, 0, sizeof(mc_lgr_reply));   /* fresh reply table */
   /* FIXME: Don't reallocate between moves. */
   tree.nodes = malloc(nodes * sizeof(*tree.nodes));
   gg_assert(tree.nodes);

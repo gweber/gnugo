@@ -38,7 +38,17 @@ Playing-strength work (heuristic engine, no neural nets):
   cheap (see the perf profile via regression/selfplay/profile_mc.sh)
 - evaluated GRAVE (Generalized RAVE, Cazenave 2015) on top of RAVE: measured
   -27 +/- 28 Elo over 600 games (it adds noise to GNU Go's already-strong
-  per-node RAVE), so it was NOT adopted
+  per-node RAVE), so it was NOT adopted (kept flag-gated for 19x19 retest)
+- joint-tuned the (untuned) RAVE constants via parallel SPSA with the full
+  stack enabled: adopted RAVE_EQUIV 1000->530, RAVE_C 0.5->0.41,
+  RAVE_FPU 0.5->0.57 (+14 +/- 28 Elo over 600 games on 9x9)
+- evaluated two more Moggy/Fuego playout rules, both flag-gated and both
+  measured to HURT on 9x9, so NOT enabled (retained for 19x19 retest):
+  LGRF / Last-Good-Reply (GNUGO_MC_LGRF, -45 +/- 34) and atari-response
+  (GNUGO_MC_ATARI, -42 +/- 40). Instructive: forcing "stronger" tactical
+  playout moves unbalances the simulations (cf. Silver & Tesauro,
+  simulation balancing) -- only self-atari *avoidance* (removing bad moves)
+  helped. Useful negative results that map the search space.
 - add a global selective-search prototype (regression/selfplay/selective_engine.py):
   one-ply lookahead over gnugo's own top moves scored by estimate_score;
   measured strength-neutral at 1 ply (see SELECTIVE_SEARCH.md) -- mechanism
