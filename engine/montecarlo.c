@@ -1529,6 +1529,24 @@ struct mc_game {
 };
 
 
+/* Whether the playout policy should reject self-atari moves. The classic
+ * Moggy/Fuego light-playout heuristic (Gelly et al.; Baudis & Gailly): in
+ * simulations, self-atari moves are almost always bad and degrade the value
+ * estimate. Gated by GNUGO_MC_AVOID_SELFATARI (default off) for A/B testing
+ * via regression/selfplay/. -1 = uninitialized, 0 = off, 1 = on. */
+static int mc_avoid_self_atari_flag = -1;
+
+static int
+mc_avoid_self_atari_enabled(void)
+{
+  if (mc_avoid_self_atari_flag < 0) {
+    const char *v = getenv("GNUGO_MC_AVOID_SELFATARI");
+    mc_avoid_self_atari_flag = (v && *v && *v != '0') ? 1 : 0;
+  }
+  return mc_avoid_self_atari_flag;
+}
+
+
 /* Generate a random move. */
 static int
 mc_generate_random_move(struct mc_game *game)
@@ -1632,23 +1650,31 @@ mc_generate_random_move(struct mc_game *game)
   if (*move_value_sum == 0)
     move = PASS_MOVE;
   else {
-    /* First choose a partition. */
-    x = (int) (gg_drand() * *move_value_sum);
-    for (k = 0; k < NUM_MOVE_PARTITIONS; k++) {
-      x -= partition_sums[k];
-      if (x < 0)
-	break;
-    }
+    /* Optionally reject self-atari moves by bounded rejection sampling.
+     * Self-atari is already computed during value updates, so the check is
+     * cheap; a few retries remove most self-ataris without an unbounded loop
+     * if the value mass happens to sit on one. */
+    int sa_retries = mc_avoid_self_atari_enabled() ? 2 : 0;
+    do {
+      /* First choose a partition. */
+      x = (int) (gg_drand() * *move_value_sum);
+      for (k = 0; k < NUM_MOVE_PARTITIONS; k++) {
+	x -= partition_sums[k];
+	if (x < 0)
+	  break;
+      }
 
-    /* Then choose a move in that partition. */
-    x = (unsigned int) (gg_drand() * partition_sums[k]);
-    for (pos = partition_lists[k]; pos != 1; pos = partition_lists[pos]) {
-      x -= move_values[pos];
-      if (x < 0)
-	break;
-    }
+      /* Then choose a move in that partition. */
+      x = (unsigned int) (gg_drand() * partition_sums[k]);
+      for (pos = partition_lists[k]; pos != 1; pos = partition_lists[pos]) {
+	x -= move_values[pos];
+	if (x < 0)
+	  break;
+      }
 
-    move = pos;
+      move = pos;
+    } while (sa_retries-- > 0 && move != PASS_MOVE && mc->board[move] == EMPTY
+	     && mc_is_self_atari(mc, move, color));
 #if !TURN_OFF_ASSERTIONS
     ASSERT1(move == PASS_MOVE || move_values[move] > 0, move);
     ASSERT1(move == PASS_MOVE || mc->board[move] == EMPTY, move);

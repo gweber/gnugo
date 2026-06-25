@@ -30,6 +30,15 @@ Playing-strength work (heuristic engine, no neural nets):
 - add a df-pn (depth-first proof-number) ladder solver module (dfpn.c),
   exposed via the GTP test command dfpn_attack; sound (validated to agree
   with attack() with zero unsound results) but scoped to ladders/captures
+- add self-atari avoidance to the Monte Carlo playout policy (Moggy/Fuego-
+  style light-playout heuristic): bounded rejection sampling skips self-atari
+  moves in simulations. Gated by GNUGO_MC_AVOID_SELFATARI (default off);
+  measured +31 +/- 28 Elo over 600 games vs MC+RAVE on 9x9 -- a confirmed
+  gain. Self-atari is already computed during value updates, so the check is
+  cheap (see the perf profile via regression/selfplay/profile_mc.sh)
+- evaluated GRAVE (Generalized RAVE, Cazenave 2015) on top of RAVE: measured
+  -27 +/- 28 Elo over 600 games (it adds noise to GNU Go's already-strong
+  per-node RAVE), so it was NOT adopted
 - add a global selective-search prototype (regression/selfplay/selective_engine.py):
   one-ply lookahead over gnugo's own top moves scored by estimate_score;
   measured strength-neutral at 1 ply (see SELECTIVE_SEARCH.md) -- mechanism
