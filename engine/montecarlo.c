@@ -2587,7 +2587,7 @@ uct_finish_and_score_game(struct mc_game *game)
  * a position's value (simulation-balancing diagnostic / training). */
 static unsigned int mc_pv_rng = 0x9E3779B9U;
 float
-mc_playout_value(int color, int n)
+mc_playout_value_settled(int color, int n, const unsigned char *settled)
 {
   int wins = 0;
   int k;
@@ -2603,13 +2603,19 @@ mc_playout_value(int color, int n)
     game.last_move = get_last_move();
     game.depth = 0;
     for (pos = 0; pos < BOARDMAX; pos++)
-      game.settled[pos] = 0;
+      game.settled[pos] = settled ? settled[pos] : 0;
     game.rng = &mc_pv_rng;
     result = komi + mc_play_random_game(&game);
     if ((result > 0) == (color == WHITE))
       wins++;
   }
   return (float) wins / n;
+}
+
+float
+mc_playout_value(int color, int n)
+{
+  return mc_playout_value_settled(color, n, NULL);
 }
 
 /* LGRF update for a finished playout (result = komi + score, >0 favors
