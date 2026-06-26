@@ -2549,11 +2549,28 @@ uct_update_move_ordering(struct uct_tree *tree, int move)
 }
 
 
+/* Strength of the classical (influence/shape) move-value prior in the MC tree:
+ * move_score = PRIOR * potential_moves - 1.  Higher => the search expands the
+ * positionally-good (more KataGo-like) moves harder; default 10 = unchanged. */
+static float mc_prior_val = -1.0;
+static float
+mc_prior(void)
+{
+  if (mc_prior_val < 0.0) {
+    const char *v = getenv("GNUGO_MC_PRIOR");
+    mc_prior_val = (v && *v) ? (float) atof(v) : 10.0;
+    if (mc_prior_val < 0.0)
+      mc_prior_val = 10.0;
+  }
+  return mc_prior_val;
+}
+
 static void
 uct_init_move_ordering(struct uct_tree *tree)
 {
   int pos;
   int k = 0;
+  float prior = mc_prior();
   /* FIXME: Exclude forbidden moves. */
   memset(tree->move_score, 0, sizeof(tree->move_score));
   for (pos = BOARDMIN; pos < BOARDMAX; pos++)
@@ -2568,7 +2585,7 @@ uct_init_move_ordering(struct uct_tree *tree)
   /* FIXME: Quick and dirty experiment. */
   for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
     if (ON_BOARD(pos)) {
-      tree->move_score[pos] = (int) (10 * potential_moves[pos]) - 1;
+      tree->move_score[pos] = (int) (prior * potential_moves[pos]) - 1;
       uct_update_move_ordering(tree, pos);
     }
   }
@@ -3327,6 +3344,7 @@ mc_prime_flag_caches(void)
   (void) grave_enabled();
   (void) mc_value_shrink();
   (void) mc_maxent();
+  (void) mc_prior();
   (void) mc_avoid_self_atari_enabled();
   (void) mc_mercy_margin();
   (void) lgrf_enabled();
