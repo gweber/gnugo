@@ -1909,19 +1909,203 @@ static int mc_play_random_move(struct mc_game *game, int move)
   return result;
 }
 
+/* Benson's unconditional-life (pass-alive) analysis on the MC board, ported from
+ * tugo (benson.rs).  An NN-free, exact way to fix the playout's worst scoring
+ * error: a group that is DEAD but still on the board at the end of a random
+ * playout is counted as alive by the crude adjacency scoring.  Benson marks the
+ * pass-alive stones of each colour and their enclosed territory; a dead group is
+ * not pass-alive and sits in a region enclosed by the opponent's pass-alive
+ * stones, so it is correctly scored as the opponent's.  Gated by GNUGO_MC_LD. */
+#define MC_BENSON_MAX 256
+static int mc_ld_flag = -1;
+static int
+mc_ld_enabled(void)
+{
+  if (mc_ld_flag < 0) {
+    const char *v = getenv("GNUGO_MC_LD");
+    mc_ld_flag = (v && *v && atoi(v) != 0);
+  }
+  return mc_ld_flag;
+}
+
+/* Mark owner[pos]=c for colour c's pass-alive stones + their enclosed territory.
+ * Returns 0 (and leaves owner untouched for c) if the board has too many chains
+ * or regions for the fixed work arrays -- the caller then keeps adjacency. */
+static int
+mc_benson_color(struct mc_board *mc, int c, unsigned char *owner)
+{
+  static int chain_of[BOARDMAX];
+  static int region_of[BOARDMAX];
+  static char chain_alive[MC_BENSON_MAX];
+  static char region_alive[MC_BENSON_MAX];
+  static char vital[MC_BENSON_MAX * MC_BENSON_MAX];
+  static char border[MC_BENSON_MAX * MC_BENSON_MAX];
+  static int stack[BOARDMAX];
+  int nchains = 0, nregions = 0;
+  int pos, k, ri, ci, sp;
+
+  for (pos = 0; pos < BOARDMAX; pos++) {
+    chain_of[pos] = -1;
+    region_of[pos] = -1;
+  }
+  /* Chains of colour c (4-connected). */
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++)
+    if (mc->board[pos] == c && chain_of[pos] == -1) {
+      if (nchains >= MC_BENSON_MAX)
+	return 0;
+      sp = 0;
+      stack[sp++] = pos;
+      chain_of[pos] = nchains;
+      while (sp) {
+	int p = stack[--sp];
+	for (k = 0; k < 4; k++)
+	  if (mc->board[p + delta[k]] == c && chain_of[p + delta[k]] == -1) {
+	    chain_of[p + delta[k]] = nchains;
+	    stack[sp++] = p + delta[k];
+	  }
+      }
+      nchains++;
+    }
+  /* Regions = connected components of not-c on-board points. */
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++)
+    if (MC_ON_BOARD(pos) && mc->board[pos] != c && region_of[pos] == -1) {
+      if (nregions >= MC_BENSON_MAX)
+	return 0;
+      sp = 0;
+      stack[sp++] = pos;
+      region_of[pos] = nregions;
+      while (sp) {
+	int p = stack[--sp];
+	for (k = 0; k < 4; k++) {
+	  int nb = p + delta[k];
+	  if (MC_ON_BOARD(nb) && mc->board[nb] != c && region_of[nb] == -1) {
+	    region_of[nb] = nregions;
+	    stack[sp++] = nb;
+	  }
+	}
+      }
+      nregions++;
+    }
+  for (ri = 0; ri < nregions; ri++)
+    for (ci = 0; ci < nchains; ci++) {
+      vital[ri * MC_BENSON_MAX + ci] = 0;
+      border[ri * MC_BENSON_MAX + ci] = 0;
+    }
+  /* Border chains of each region. */
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
+    if (region_of[pos] < 0)
+      continue;
+    for (k = 0; k < 4; k++)
+      if (mc->board[pos + delta[k]] == c)
+	border[region_of[pos] * MC_BENSON_MAX + chain_of[pos + delta[k]]] = 1;
+  }
+  /* Vital: every EMPTY point of the region is adjacent to the chain. */
+  for (ri = 0; ri < nregions; ri++)
+    for (ci = 0; ci < nchains; ci++) {
+      int is_vital = 1;
+      if (!border[ri * MC_BENSON_MAX + ci])
+	continue;
+      for (pos = BOARDMIN; pos < BOARDMAX && is_vital; pos++) {
+	int adj = 0;
+	if (region_of[pos] != ri || mc->board[pos] != EMPTY)
+	  continue;
+	for (k = 0; k < 4; k++)
+	  if (mc->board[pos + delta[k]] == c && chain_of[pos + delta[k]] == ci) {
+	    adj = 1;
+	    break;
+	  }
+	if (!adj)
+	  is_vital = 0;
+      }
+      vital[ri * MC_BENSON_MAX + ci] = (char) is_vital;
+    }
+  /* Benson iteration. */
+  for (ci = 0; ci < nchains; ci++)
+    chain_alive[ci] = 1;
+  for (ri = 0; ri < nregions; ri++)
+    region_alive[ri] = 1;
+  for (;;) {
+    int changed = 0;
+    for (ci = 0; ci < nchains; ci++) {
+      int vc = 0;
+      if (!chain_alive[ci])
+	continue;
+      for (ri = 0; ri < nregions; ri++)
+	if (region_alive[ri] && vital[ri * MC_BENSON_MAX + ci])
+	  vc++;
+      if (vc < 2) {
+	chain_alive[ci] = 0;
+	changed = 1;
+      }
+    }
+    for (ri = 0; ri < nregions; ri++) {
+      if (!region_alive[ri])
+	continue;
+      for (ci = 0; ci < nchains; ci++)
+	if (border[ri * MC_BENSON_MAX + ci] && !chain_alive[ci]) {
+	  region_alive[ri] = 0;
+	  changed = 1;
+	  break;
+	}
+    }
+    if (!changed)
+      break;
+  }
+  /* Mark owner: pass-alive stones + territory (regions vital to an alive chain). */
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++)
+    if (mc->board[pos] == c && chain_alive[chain_of[pos]])
+      owner[pos] = (unsigned char) c;
+  for (ri = 0; ri < nregions; ri++) {
+    int vital_to_alive = 0;
+    if (!region_alive[ri])
+      continue;
+    for (ci = 0; ci < nchains; ci++)
+      if (vital[ri * MC_BENSON_MAX + ci] && chain_alive[ci]) {
+	vital_to_alive = 1;
+	break;
+      }
+    if (vital_to_alive)
+      for (pos = BOARDMIN; pos < BOARDMAX; pos++)
+	if (region_of[pos] == ri)
+	  owner[pos] = (unsigned char) c;
+  }
+  return 1;
+}
+
+static void
+mc_benson_owner(struct mc_board *mc, unsigned char *owner)
+{
+  int pos;
+  for (pos = 0; pos < BOARDMAX; pos++)
+    owner[pos] = EMPTY;
+  mc_benson_color(mc, BLACK, owner);
+  mc_benson_color(mc, WHITE, owner);
+}
+
 /* Score the current playout position from White's perspective: +1 per White
- * point, -1 per Black point (unsettled empties go to the adjacent color). */
+ * point, -1 per Black point.  With GNUGO_MC_LD, Benson pass-alive ownership
+ * overrides for the points it settles (dead groups -> the enclosing colour);
+ * elsewhere, settled territory then adjacency, as before. */
 static int
 mc_score_game(struct mc_game *game)
 {
   struct mc_board *mc = &game->mc;
+  static unsigned char benson_owner[BOARDMAX];
+  int use_ld = mc_ld_enabled();
   int score = 0;
   int pos;
   int k;
 
+  if (use_ld)
+    mc_benson_owner(mc, benson_owner);
+
   for (pos = BOARDMIN; pos < BOARDMAX; pos++)
     if (MC_ON_BOARD(pos)) {
-      if (game->settled[pos] == WHITE)
+      if (use_ld && benson_owner[pos] == WHITE)
+	score++;
+      else if (use_ld && benson_owner[pos] == BLACK)
+	score--;
+      else if (game->settled[pos] == WHITE)
 	score++;
       else if (game->settled[pos] == BLACK)
 	score--;
