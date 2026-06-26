@@ -504,6 +504,8 @@ int mc_load_patterns_from_db(const char *filename, unsigned int *values);
 void mc_init_patterns(const unsigned int *values);
 int choose_mc_patterns(char *name);
 void list_mc_patterns(void);
+int mc_move_pattern_ids(int color, int *moves, int *ids);
+float mc_playout_value(int color, int n);
 
 void uct_genmove(int color, int *move, int *forbidden_moves,
 		 int *allowed_moves, int nodes, float *move_values,

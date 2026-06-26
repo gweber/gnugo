@@ -1348,12 +1348,70 @@ mc_load_patterns_from_db(const char *filename, unsigned int *values)
 }
 
 
-/* Set up local pattern values. */
+/* Set up local pattern values.  If GNUGO_MC_VALUES names a file, the
+ * compiled-in table is overwritten with a learned one (raw little-endian
+ * uint32 array of mc_get_size_of_pattern_values_table() entries) -- the load
+ * path for a fitted Tier-1 playout policy. */
 void
 mc_init_patterns(const unsigned int *values)
 {
+  const char *learned;
   mc_init_pattern_geometries();
   memcpy(mc_patterns.values, values, sizeof(mc_patterns.values));
+
+  learned = getenv("GNUGO_MC_VALUES");
+  if (learned && *learned) {
+    FILE *fp = fopen(learned, "rb");
+    if (!fp)
+      fprintf(stderr, "GNUGO_MC_VALUES: cannot open %s\n", learned);
+    else {
+      size_t n = (size_t) (NUM_GEOMETRIES + 1) * NUM_PROPERTIES;
+      size_t got = fread(mc_patterns.values, sizeof(unsigned int), n, fp);
+      fclose(fp);
+      if (got != n)
+	fprintf(stderr, "GNUGO_MC_VALUES: read only %zu of %zu values from %s\n",
+		got, n, learned);
+    }
+  }
+}
+
+/* Training hook: for the side to move, fill moves[]/ids[] with every legal move
+ * and the pattern value-table index it would sample under (matching
+ * mc_add_move's near=0 and the playout's near=1 boost for moves in the last
+ * move's 8-neighbourhood).  Returns the count.  Used to fit the playout policy
+ * (Bradley-Terry / MM) from real games, in-process (no GTP round-trip). */
+int
+mc_move_pattern_ids(int color, int *moves, int *ids)
+{
+  static int geom_inited = 0;
+  struct mc_board mcb;
+  struct mc_board *mc = &mcb;	/* the MC_ON_BOARD/mc_is_suicide macros use mc-> */
+  int last = get_last_move();
+  int pos;
+  int n = 0;
+  if (!geom_inited) {		/* index needs geometry_table even w/o MC mode */
+    mc_init_pattern_geometries();
+    geom_inited = 1;
+  }
+  mc_init_board_from_global_board(mc);
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
+    if (MC_ON_BOARD(pos) && mc->board[pos] == EMPTY
+	&& !mc_is_suicide(mc, pos, color)) {
+      int near = 0;
+      if (last != NO_MOVE && last != PASS_MOVE) {
+	int k;
+	for (k = 0; k < 8; k++)
+	  if (pos == last + delta[k]) {
+	    near = 1;
+	    break;
+	  }
+      }
+      moves[n] = pos;
+      ids[n] = mc_find_pattern_number(mc, pos, color, near);
+      n++;
+    }
+  }
+  return n;
 }
 
 
@@ -2337,6 +2395,37 @@ static float
 uct_finish_and_score_game(struct mc_game *game)
 {
   return komi + mc_play_random_game(game);
+}
+
+/* Run n plain playouts from the current global board with `color` to move and
+ * return the fraction won by `color` (komi-aware).  This is V_theta(s) under
+ * the current playout policy -- used to measure how well the playout estimates
+ * a position's value (simulation-balancing diagnostic / training). */
+static unsigned int mc_pv_rng = 0x9E3779B9U;
+float
+mc_playout_value(int color, int n)
+{
+  int wins = 0;
+  int k;
+  int pos;
+  for (k = 0; k < n; k++) {
+    struct mc_game game;
+    float result;
+    mc_init_board_from_global_board(&game.mc);
+    mc_init_move_values(&game.mc);
+    game.color_to_move = color;
+    game.consecutive_passes = 0;
+    game.consecutive_ko_captures = 0;
+    game.last_move = get_last_move();
+    game.depth = 0;
+    for (pos = 0; pos < BOARDMAX; pos++)
+      game.settled[pos] = 0;
+    game.rng = &mc_pv_rng;
+    result = komi + mc_play_random_game(&game);
+    if ((result > 0) == (color == WHITE))
+      wins++;
+  }
+  return (float) wins / n;
 }
 
 /* LGRF update for a finished playout (result = komi + score, >0 favors
