@@ -476,7 +476,7 @@ static GmpResult  processCommand(Gmp *ge, Command command, int val,
 static void  putCommand(Gmp *ge, Command cmd, int val)  {
   if (ge->waitingHighAck &&
       (cmd != cmd_ack) && (cmd != cmd_respond) && (cmd != cmd_deny))  {
-    if (ge->sendsQueued < 1024)  {
+    if (ge->sendsQueued < GMP_MAXSENDSQUEUED)  {	/* was < 1024; array is [16] */
       ge->sendsPending[ge->sendsQueued].cmd = cmd;
       ge->sendsPending[ge->sendsQueued].val = val;
       ++ge->sendsQueued;

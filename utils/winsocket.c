@@ -115,11 +115,11 @@ winsocket_fread(void *buffer, size_t size, size_t num_items, FILE *file)
   else {
     assert(socket_handle != 0);
     if (recv(socket_handle, (char *) buffer, size * num_items, 0)
-	== size * num_items)
+	== (int) (size * num_items))
       return num_items;
     else {
       socket_end_of_file = 1;
-      return EOF;
+      return 0;	/* fread-style short count; was EOF (-1 -> SIZE_MAX as size_t) */
     }
   }
 }
@@ -147,7 +147,7 @@ winsocket_fgets(char *buffer, int size, FILE *file)
     if (stored_length == 0)
       return NULL;
 
-    buffer[stored_length + 1] = 0;
+    buffer[stored_length] = 0;	/* was [stored_length + 1]: 1 past the last byte (OOB when full) */
     return buffer;
   }
 }
@@ -221,6 +221,10 @@ winsocket_vfprintf(FILE *file, const char *format_string, va_list arguments)
     int length = _vsnprintf(buffer, sizeof buffer, format_string, arguments);
 
     assert(socket_handle != 0);
+    /* _vsnprintf returns negative on truncation; clamp so a negative length is
+     * never passed to send() as a (huge) byte count. */
+    if (length < 0 || length > (int) sizeof buffer)
+      length = (int) sizeof buffer - 1;
     return send(socket_handle, buffer, length, 0) == length ? length : -1;
   }
 }
