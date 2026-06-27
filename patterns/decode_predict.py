@@ -8,7 +8,7 @@ idx = np.random.RandomState(7).permutation(N)[:int(sys.argv[3])]
 with open(sys.argv[2], 'w') as f:
     for i in idx:
         o = obs[i]; cur = o[:,:,0]>0.5; opp = o[:,:,1]>0.5
-        btm = o[:,:,16].mean() < 0.5   # plane16==1 => WHITE to move (verified vs parity)
+        btm = o[:,:,16].mean() > 0.5   # calibration-verified polarity (see decode_positions.py)
         ctm = 'B' if btm else 'W'; oc = 'W' if btm else 'B'
         am = int(pol[i].argmax())
         kr, kc = (-1,-1) if am==81 else (am//9, am%9)
