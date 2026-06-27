@@ -1,10 +1,14 @@
 #!/bin/sh
 # Profile-Guided Optimization build for GNU Go's Monte-Carlo engine.
 #
-# The MC playout is a branchy hot loop; PGO lays out its branches/inlining from
-# a real run and buys ~4% fewer cycles (measured) = ~4% more simulations at fixed
-# wall-time, with no source change and identical strength.  Set LTO=1 to also try
-# link-time optimization (cross-file inlining of the board primitives).
+# The MC playout is a branchy hot loop, the classic case PGO helps.  HONESTY
+# CAVEAT: on the machine this was developed on (a loaded big.LITTLE box, and a
+# RANDOMIZED playout workload) the effect could NOT be measured reliably -- the
+# run-to-run cycle noise (~3-6%) swamped any PGO/-O3 vs stock -O2 difference, and
+# -O2 measured as fast as anything.  So treat this as a sound-but-unproven build
+# option, not a guaranteed win; verify with `perf stat -e cycles` on a QUIET
+# machine and a FIXED position before relying on it.  No source change, identical
+# strength either way.  Set LTO=1 to also try link-time optimization.
 #
 #   ./pgo-build.sh          # PGO only
 #   LTO=1 ./pgo-build.sh    # PGO + LTO
