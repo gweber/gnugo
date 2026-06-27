@@ -80,6 +80,16 @@ def main():
     ap.add_argument("--crn", action="store_true", help="common random numbers")
     args = ap.parse_args()
 
+    # The LLR model drops draws and treats elo as P(win) among decided games,
+    # which only matches the elo0/elo1 hypotheses when the draw rate is ~0. That
+    # holds at half-integer komi (jigo impossible). At integer komi draws occur,
+    # E[score] != P(win), and the bounds would test a subtly mis-specified
+    # quantity -- warn rather than silently mislead.
+    if abs(args.komi - round(args.komi)) < 1e-6:
+        print(f"  [warn] komi={args.komi} is integer: draws are possible, but the "
+              f"SPRT LLR model assumes ~zero draws (use half-integer komi).",
+              flush=True)
+
     p0, p1 = elo_to_p(args.elo0), elo_to_p(args.elo1)
     # SPRT acceptance bounds on the log-likelihood ratio.
     lower = math.log(args.beta / (1.0 - args.alpha))
@@ -103,7 +113,14 @@ def main():
                     for j in range(args.workers)]
             idx += args.workers
             for f in wave:
-                r = f.result()
+                try:
+                    r = f.result()
+                except Exception as e:
+                    # A single crashed / timed-out / illegal-move game must not
+                    # abort a multi-thousand-game run; log and skip it (it is
+                    # never miscounted as a win or loss).
+                    print(f"  [warn] game errored, skipping: {e}", flush=True)
+                    continue
                 if r == 1:
                     a_wins += 1
                     llr += win_inc

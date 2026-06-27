@@ -69,6 +69,16 @@ class GtpEngine:
             self.proc.terminate()
         except Exception:
             pass
+        # Reap the child so long parallel runs (thousands of games) don't leak
+        # zombies / file descriptors and eventually fail to spawn new engines.
+        try:
+            self.proc.wait(timeout=5)
+        except Exception:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
 
 
 def play_game(black, white, size, komi, seed=None):

@@ -49,7 +49,11 @@ def parallel_match(cmd_a, cmd_b, games, size, komi, workers):
         futures = [ex.submit(_one_game, i, cmd_a, cmd_b, size, komi)
                    for i in range(games)]
         for f in concurrent.futures.as_completed(futures):
-            r = f.result()
+            try:
+                r = f.result()
+            except Exception as e:
+                print(f"  [warn] game errored, skipping: {e}", flush=True)
+                continue
             if r == 1:
                 a_wins += 1
             elif r == -1:
