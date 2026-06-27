@@ -3,7 +3,11 @@
 file the C tools can replay:  one line per position
     <target> <ctm> <nstones> <r c col> <r c col> ...
 target = P(side-to-move wins) = (value+1)/2 ; ctm/col in {B,W}.
-obs plane 0 = side-to-move stones, plane 1 = opponent, plane 16 = colour flag.
+obs plane 0 = side-to-move stones, plane 1 = opponent, plane 16 = side-to-move
+colour flag.  VERIFIED against the data (move parity = plane0-plane1 stone diff):
+plane16==1 <=> WHITE to move, plane16==0 <=> BLACK to move.  The original default
+had this INVERTED (treated plane16>0.5 as black) -- corrected below.  If you ever
+passed the "flip" arg to fix it, DROP it now (the default is correct).
 """
 import numpy as np
 import sys
@@ -21,7 +25,7 @@ with open(out, "w") as f:
         o = obs[i]
         cur = o[:, :, 0] > 0.5
         opp = o[:, :, 1] > 0.5
-        black_to_move = (o[:, :, 16].mean() > 0.5) ^ flip
+        black_to_move = (o[:, :, 16].mean() < 0.5) ^ flip   # plane16==1 => WHITE
         ctm = "B" if black_to_move else "W"
         oc = "W" if black_to_move else "B"
         target = (float(val[i]) + 1.0) / 2.0

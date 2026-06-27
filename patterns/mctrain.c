@@ -190,7 +190,7 @@ main(int argc, char **argv)
 	bmin = base[i];
       if ((long) base[i] > bmax)
 	bmax = base[i];
-      if (W[i] > 0.0 || denom[i] > 0.0) {
+      if (W[i] > 0.0) {		/* only CHOSEN contexts have a real learned gamma */
 	base_mean += base[i];
 	gamma_mean += gamma[i];
 	trained++;
@@ -203,7 +203,9 @@ main(int argc, char **argv)
     scale = (gamma_mean > 0.0) ? base_mean / gamma_mean : 1.0;
     mean = base_mean;
     for (i = 0; i < table_size; i++)
-      if (W[i] > 0.0 || denom[i] > 0.0) {
+      if (W[i] > 0.0) {		/* CHOSEN-only: a "competed-never-chosen" context has */
+				/* gamma==0, which would overwrite its tuned baseline */
+				/* with the floor (1) and corrupt the playout policy */
 	double v = gamma[i] * scale;		/* onto baseline scale */
 	if (v < 1.0)
 	  v = 1.0;
