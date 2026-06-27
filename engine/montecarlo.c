@@ -1577,7 +1577,11 @@ mc_update_move_values(struct mc_board *mc)
 
 struct mc_game {
   struct mc_board mc;
-  int move_history[600];
+  /* The playout gives up (forces passes) once depth > 600; a few trailing passes
+   * can follow before 3 consecutive passes end it, so size past 603 to keep the
+   * depth-indexed write in mc_play_random_move (and the giveup debug dump) in
+   * bounds.  Was [600] -- a 1-past-the-end write at depth 600. */
+  int move_history[620];
   unsigned char settled[BOARDMAX];
   int color_to_move;
   int last_move;
@@ -2825,8 +2829,11 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
 		    : (float) child_node->wins / n;
     /* Exploitation term: the max-entropy backup value when enabled, else the
      * plain Monte-Carlo mean.  best_winrate (the gamma early-cutoff below) stays
-     * on the true mean so that logic is unchanged. */
-    float exploit = maxent_tau > 0.0 ? child_node->soft_w : winrate;
+     * on the true mean so that logic is unchanged.  soft_w is only backed up on
+     * the SERIAL path (uct_traverse_tree); under tree parallelism it stays 0, so
+     * fall back to the true winrate there instead of collapsing exploit to 0. */
+    float exploit = (maxent_tau > 0.0 && !tree->parallel) ? child_node->soft_w
+							  : winrate;
     float value = exploit;
     if (ON_BOARD(m) && ag[m] > 0) {
       float rave = (float) aw[m] / ag[m];
@@ -3408,6 +3415,7 @@ mc_prime_flag_caches(void)
   (void) lgrf_enabled();
   (void) mc_lgrf_prob();
   (void) mc_atari_prob();
+  (void) mc_ld_enabled();
 }
 
 static void
@@ -3591,6 +3599,13 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
    * Prime the flag caches first so worker threads never race on lazy getenv
    * init.  GNUGO_MC_THREADS=1 (default) falls through to the original path. */
   mc_prime_flag_caches();
+  /* Reset the (file-global) LGRF reply table BEFORE dispatching, so it is fresh
+   * every genmove in the parallel paths too -- the reset below only runs on the
+   * single-thread path, which left replies leaking across moves and games under
+   * GNUGO_MC_THREADS/TREE_THREADS.  (Tree-parallel never reinforces the table, so
+   * there it simply stays empty = LGRF inert; root-parallel reinforces it.) */
+  if (lgrf_enabled())
+    memset(mc_lgr_reply, 0, sizeof(mc_lgr_reply));
   if (mc_num_tree_threads() > 1) {
     uct_genmove_tree_parallel(mc_num_tree_threads(), &starting_position,
 			      forbidden_moves, allowed_moves, nodes, move,
@@ -3614,8 +3629,7 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
 
   tree.game = starting_position;
   tree.root_color = color;
-  if (lgrf_enabled())
-    memset(mc_lgr_reply, 0, sizeof(mc_lgr_reply));   /* fresh reply table */
+  /* (LGRF reply table already reset above, before the parallel dispatch.) */
   /* FIXME: Don't reallocate between moves. */
   tree.nodes = malloc(nodes * sizeof(*tree.nodes));
   gg_assert(tree.nodes);
