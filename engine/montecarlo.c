@@ -2565,6 +2565,40 @@ mc_prior(void)
   return mc_prior_val;
 }
 
+/* Virtual-loss weight for tree-parallel selection: a descending thread counts
+ * as GNUGO_MC_VLOSS extra (lost) visits, so siblings diverge more/less.  The
+ * tree-parallel mode (+237 Elo) was never tuned for this; default 1.0. */
+static float mc_vloss_val = -1.0;
+static float
+mc_vloss(void)
+{
+  if (mc_vloss_val < 0.0) {
+    const char *v = getenv("GNUGO_MC_VLOSS");
+    mc_vloss_val = (v && *v) ? (float) atof(v) : 1.0;
+    if (mc_vloss_val < 0.0)
+      mc_vloss_val = 1.0;
+  }
+  return mc_vloss_val;
+}
+
+/* Final root-move selection policy.  0 (default): highest-winrate child.  1:
+ * the ROBUST child (most visits, winrate tie-break) -- the standard MCTS choice
+ * that avoids picking a child with a spuriously high winrate from very few
+ * visits.  Tree parallelism's virtual loss scatters threads onto low-visit
+ * siblings, so the winrate-without-visit-floor pitfall is amplified here. */
+static int mc_robust_val = -1;
+static int
+mc_robust(void)
+{
+  if (mc_robust_val < 0) {
+    const char *v = getenv("GNUGO_MC_ROBUST");
+    mc_robust_val = (v && *v) ? atoi(v) : 0;
+    if (mc_robust_val < 0)
+      mc_robust_val = 0;
+  }
+  return mc_robust_val;
+}
+
 static void
 uct_init_move_ordering(struct uct_tree *tree)
 {
@@ -2767,6 +2801,7 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
   float best_pos_value;
   float shrink = mc_value_shrink();
   float maxent_tau = mc_maxent();
+  float vloss = mc_vloss();
 
   /* Score the existing children.  In tree-parallel mode load the list head with
    * an acquire to pair with the release publish in uct_find_node (older arcs are
@@ -2780,7 +2815,11 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
      * child as extra visits with no wins, so concurrent threads diverge. */
     int vl = tree->parallel
 	     ? __atomic_load_n(&child_node->virtual_loss, __ATOMIC_RELAXED) : 0;
-    float n = (float) (child_node->games + vl);
+    /* n can be 0 for a child another thread has just published (games==0) before
+     * it bumps virtual_loss; guard the divide so winrate is a finite 0, not NaN. */
+    float n = (float) child_node->games + vloss * vl;
+    if (n <= 0.0)
+      n = 1.0;
     float winrate = shrink > 0.0
 		    ? (child_node->wins + 0.5 * shrink) / (n + shrink)
 		    : (float) child_node->wins / n;
@@ -3217,16 +3256,33 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
     pthread_join(threads[t], NULL);
 
   *move = PASS_MOVE;
-  for (arc = root->child; arc; arc = arc->next) {
-    struct uct_node *node = arc->node;
-    if (node->games == 0)
-      continue;
-    move_frequencies[arc->move] = node->games;
-    move_values[arc->move] = (float) node->wins / node->games;
-    if (best_score * node->games < node->wins) {
-      *move = arc->move;
-      best_score = (float) node->wins / node->games;
+  {
+    int robust = mc_robust();
+    int best_games = -1;
+    float best_games_wr = -1.0;
+    int robust_move = PASS_MOVE;
+    for (arc = root->child; arc; arc = arc->next) {
+      struct uct_node *node = arc->node;
+      float wr;
+      if (node->games == 0)
+	continue;
+      move_frequencies[arc->move] = node->games;
+      wr = (float) node->wins / node->games;
+      move_values[arc->move] = wr;
+      if (best_score * node->games < node->wins) {
+	*move = arc->move;
+	best_score = wr;
+      }
+      /* Robust child: most visits, winrate as the tie-break. */
+      if (node->games > best_games
+	  || (node->games == best_games && wr > best_games_wr)) {
+	best_games = node->games;
+	best_games_wr = wr;
+	robust_move = arc->move;
+      }
     }
+    if (robust && robust_move != PASS_MOVE)
+      *move = robust_move;
   }
 
   free(shared_nodes);
@@ -3345,6 +3401,8 @@ mc_prime_flag_caches(void)
   (void) mc_value_shrink();
   (void) mc_maxent();
   (void) mc_prior();
+  (void) mc_vloss();
+  (void) mc_robust();
   (void) mc_avoid_self_atari_enabled();
   (void) mc_mercy_margin();
   (void) lgrf_enabled();
@@ -3468,15 +3526,31 @@ uct_genmove_parallel(int nthreads, struct mc_game *starting_position,
     }
 
   *move = PASS_MOVE;
-  for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
-    if (total_games[pos] > 0) {
+  {
+    int robust = mc_robust();
+    int best_games = -1;
+    float best_games_wr = -1.0;
+    int robust_move = PASS_MOVE;
+    for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
+      float wr;
+      if (total_games[pos] <= 0)
+	continue;
       move_frequencies[pos] = total_games[pos];
-      move_values[pos] = (float) total_wins[pos] / total_games[pos];
+      wr = (float) total_wins[pos] / total_games[pos];
+      move_values[pos] = wr;
       if (best_score * total_games[pos] < total_wins[pos]) {
 	*move = pos;
-	best_score = (float) total_wins[pos] / total_games[pos];
+	best_score = wr;
+      }
+      if (total_games[pos] > best_games
+	  || (total_games[pos] == best_games && wr > best_games_wr)) {
+	best_games = total_games[pos];
+	best_games_wr = wr;
+	robust_move = pos;
       }
     }
+    if (robust && robust_move != PASS_MOVE)
+      *move = robust_move;
   }
 
   for (t = 0; t < nthreads; t++)
@@ -3588,14 +3662,32 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
   /* Identify the best move on the top level. */
   best_score = 0.0;
   *move = PASS_MOVE;
-  for (arc = tree.nodes[0].child; arc; arc = arc->next) {
-    node = arc->node;
-    move_frequencies[arc->move] = node->games;
-    move_values[arc->move] = (float) node->wins / node->games;
-    if (best_score * node->games < node->wins) {
-      *move = arc->move;
-      best_score = (float) node->wins / node->games;
+  {
+    int robust = mc_robust();
+    int best_games = -1;
+    float best_games_wr = -1.0;
+    int robust_move = PASS_MOVE;
+    for (arc = tree.nodes[0].child; arc; arc = arc->next) {
+      float wr;
+      node = arc->node;
+      if (node->games == 0)
+	continue;
+      move_frequencies[arc->move] = node->games;
+      wr = (float) node->wins / node->games;
+      move_values[arc->move] = wr;
+      if (best_score * node->games < node->wins) {
+	*move = arc->move;
+	best_score = wr;
+      }
+      if (node->games > best_games
+	  || (node->games == best_games && wr > best_games_wr)) {
+	best_games = node->games;
+	best_games_wr = wr;
+	robust_move = arc->move;
+      }
     }
+    if (robust && robust_move != PASS_MOVE)
+      *move = robust_move;
   }
 
   /* Dump sgf tree of the significant part of the search tree. */
