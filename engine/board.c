@@ -3229,8 +3229,9 @@ get_move_from_stack(int k, int *move, int *color)
  * by trymove() or tryko(). Use stones_on_board(BLACK | WHITE) to get
  * the total number of stones on the board.
  *
- * FIXME: This seems wrong, it uses the modified board, not the permanent
- * one. /ab
+ * (An old "/ab" FIXME worried this reads the modified board rather than the
+ * permanent one.  It does not: the gg_assert(stackp == 0) below guarantees no
+ * trymove()/tryko() is in effect, so board[] *is* the permanent position.)
  */
 int
 stones_on_board(int color)

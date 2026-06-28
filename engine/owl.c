@@ -2238,8 +2238,16 @@ do_owl_attack(int str, int *move, int *wormid,
       /* Consider only the highest scoring move if we're deeper than
        * owl_branch_depth.
        *
-       * FIXME: To behave as intended, k should be replaced by
-       *        number_tried_moves.
+       * KNOWN BUG, deliberately NOT fixed: to behave as intended k should be
+       * number_tried_moves (k is the raw candidate index, so an early-skipped
+       * candidate can break the search having tried zero moves; the four sibling
+       * guards in do_owl_attack/do_owl_defend already use number_tried_moves).
+       * But the owl verdicts feed dragon status -> move valuation -> scoring, and
+       * the whole engine is tuned around this cutoff: making the "correct" change
+       * was measured at +1 / -22 on the regression suite (one FAIL->PASS vs 22
+       * PASS->FAIL, incl. 16 in endgame1 plus score changes in newscore). Fixing
+       * it properly would mean re-tuning that entire cascade. Left as `k`.
+       * (Measured 2026-06.)
        */
       if (stackp > owl_branch_depth && k > 0)
 	break;
@@ -2823,8 +2831,16 @@ do_owl_defend(int str, int *move, int *wormid, struct local_owl_data *owl,
       /* Consider only the highest scoring move if we're deeper than
        * owl_branch_depth.
        *
-       * FIXME: To behave as intended, k should be replaced by
-       *        number_tried_moves.
+       * KNOWN BUG, deliberately NOT fixed: to behave as intended k should be
+       * number_tried_moves (k is the raw candidate index, so an early-skipped
+       * candidate can break the search having tried zero moves; the four sibling
+       * guards in do_owl_attack/do_owl_defend already use number_tried_moves).
+       * But the owl verdicts feed dragon status -> move valuation -> scoring, and
+       * the whole engine is tuned around this cutoff: making the "correct" change
+       * was measured at +1 / -22 on the regression suite (one FAIL->PASS vs 22
+       * PASS->FAIL, incl. 16 in endgame1 plus score changes in newscore). Fixing
+       * it properly would mean re-tuning that entire cascade. Left as `k`.
+       * (Measured 2026-06.)
        */
       if (stackp > owl_branch_depth && k > 0)
 	break;
@@ -5265,7 +5281,7 @@ owl_reasons(int color)
 	 * dies because the victim only formed a nakade shape.
 	 *
 	 * FIXME: This code overlaps heavily with some code in
-	 *	  examine_move_safety() in move_reasons.c. The caching
+	 *	  examine_move_safety() in value_moves.c. The caching
 	 *	  scheme should minimize the performance hit, but of course
 	 *	  it's unfortunate to have the code duplication.
 	 */
