@@ -1748,6 +1748,12 @@ mc_generate_random_move(struct mc_game *game)
     int reply = mc_lgr_reply[color == WHITE][last_move];
     if (reply != PASS_MOVE && ON_BOARD(reply) && mc->board[reply] == EMPTY
 	&& mc_is_legal(mc, reply, color)
+	/* Respect AVOID_SELFATARI: an LGRF reply otherwise bypasses the
+	 * self-atari rejection loop below, so a stored reply that is a useless
+	 * (non-capturing) self-atari would leak through when both flags are on. */
+	&& (!mc_avoid_self_atari_enabled()
+	    || mc_stones_in_atari(mc, reply, color, 1) > 0
+	    || !mc_is_self_atari(mc, reply, color))
 	&& mc_drand(game) < mc_lgrf_prob())
       return reply;
   }
@@ -2188,7 +2194,10 @@ static int mc_play_random_game(struct mc_game *game)
      * capture-driven lead), scoring by that lead's sign. Checked periodically. */
     if (mercy > 0 && ++since_check >= 24) {
       int bal = mc_stone_balance(&game->mc);
-      if (bal >= mercy || bal <= -mercy)
+      /* Decide on the KOMI-ADJUSTED lead: the winner is sign(bal + komi), so a
+       * komi-blind abort on a raw stone lead can vote opposite to a full playout
+       * near the komi boundary (e.g. bal=-3, komi=7.5 -> White actually wins). */
+      if (bal + komi >= mercy || bal + komi <= -mercy)
 	return bal;
       since_check = 0;
     }

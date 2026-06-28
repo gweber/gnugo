@@ -381,6 +381,9 @@ monte_carlo_genmove(int color, int allowed_moves[BOARDMAX],
 		&& move_frequencies[pos] > frequency_cutoff2)
 	    || move_values[best_uct_move] < 0.1)
 	&& (!allowed_moves || allowed_moves[pos])
+	&& !forbidden_move[pos]		/* don't fill our own unconditional territory:
+					 * the search excludes forbidden moves, but this
+					 * classical-prior override only checked allowed_moves */
 	&& potential_moves[pos] > best_value) {
       best_move = pos;
       best_value = potential_moves[pos];
