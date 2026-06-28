@@ -1635,7 +1635,12 @@ mc_avoid_self_atari_enabled(void)
  * the winner's replies are reinforced and the loser's are forgotten. Indexed
  * by (color == WHITE). 0 (= NO_MOVE/PASS) means "no stored reply". Gated by
  * GNUGO_MC_LGRF (default off). The table is reset per genmove. */
-static int mc_lgr_reply[2][BOARDMAX];
+/* __thread: under root parallelism every worker runs uct_traverse_tree and
+ * reinforces this table, so a single shared table would race (concurrent RMW).
+ * Per-thread also means each freshly-spawned worker starts with a zero table
+ * (auto-reset per genmove); the main thread's copy is reset by the memset in
+ * uct_genmove for the single-thread path. Default off ⇒ never touched. */
+static __thread int mc_lgr_reply[2][BOARDMAX];
 
 /* Fire PROBABILITY for the tactical override rules (Moggy-style dosing):
  * each time the rule could fire in a playout, it does so only with this
@@ -1938,13 +1943,16 @@ mc_ld_enabled(void)
 static int
 mc_benson_color(struct mc_board *mc, int c, unsigned char *owner)
 {
-  static int chain_of[BOARDMAX];
-  static int region_of[BOARDMAX];
-  static char chain_alive[MC_BENSON_MAX];
-  static char region_alive[MC_BENSON_MAX];
-  static char vital[MC_BENSON_MAX * MC_BENSON_MAX];
-  static char border[MC_BENSON_MAX * MC_BENSON_MAX];
-  static int stack[BOARDMAX];
+  /* __thread: these large work arrays are shared otherwise; mc_benson_color runs
+   * inside the playout on every worker thread (GNUGO_MC_LD), so plain statics
+   * would race (wrong scores + an out-of-bounds chain_of[] index). Per-thread. */
+  static __thread int chain_of[BOARDMAX];
+  static __thread int region_of[BOARDMAX];
+  static __thread char chain_alive[MC_BENSON_MAX];
+  static __thread char region_alive[MC_BENSON_MAX];
+  static __thread char vital[MC_BENSON_MAX * MC_BENSON_MAX];
+  static __thread char border[MC_BENSON_MAX * MC_BENSON_MAX];
+  static __thread int stack[BOARDMAX];
   int nchains = 0, nregions = 0;
   int pos, k, ri, ci, sp;
 
@@ -2094,7 +2102,7 @@ static int
 mc_score_game(struct mc_game *game)
 {
   struct mc_board *mc = &game->mc;
-  static unsigned char benson_owner[BOARDMAX];
+  static __thread unsigned char benson_owner[BOARDMAX];	/* per-thread: scored on every worker */
   int use_ld = mc_ld_enabled();
   int score = 0;
   int pos;
