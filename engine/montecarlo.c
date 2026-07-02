@@ -34,6 +34,7 @@
 #include "random.h"
 #include <math.h>
 #include <pthread.h>
+#include <stddef.h>
 
 /* FIXME: Replace with a DEBUG_MC symbol for use with -d. */
 static int mc_debug = 0;
@@ -2273,8 +2274,16 @@ struct uct_tree {
   /* GRAVE: AMAF base offset of the nearest SAME-COLOR ancestor on the current
    * descent path with >= grave_ref playouts. Per color (the AMAF tables are
    * each node's player's perspective, so borrowing across colors would invert
-   * win rates). Indexed by (color == WHITE); -1 = no reference yet. */
-  int grave_ref_base[2];
+   * win rates). Indexed by (color == WHITE); -1 = no reference yet.
+   * ptrdiff_t: node_index * BOARDMAX overflows int for large tree-parallel
+   * budgets (level 10 x 64 threads is already within 2x of INT_MAX). */
+  ptrdiff_t grave_ref_base[2];
+  /* Tree-parallel allocation safety net: if the shared node pool is exhausted
+   * (the workers' per-descent headroom check can overshoot by a few slots),
+   * allocation falls back to this per-view scratch node instead of aliasing a
+   * live slot -- rewriting a published node/arc in place can corrupt stats or
+   * self-cycle a child list.  The scratch node is never linked into the tree. */
+  struct uct_node overflow_node;
 };
 
 
@@ -2419,8 +2428,9 @@ uct_init_node(struct uct_tree *tree, int *allowed_moves)
 	    : tree->num_used_nodes++;
   struct uct_node *node;
   if (tree->parallel && idx >= tree->num_nodes)
-    idx = tree->num_nodes - 1;		/* capacity backstop: reuse last slot */
-  node = &tree->nodes[idx];
+    node = &tree->overflow_node;	/* pool exhausted: private scratch node */
+  else
+    node = &tree->nodes[idx];
 
   node->wins = 0;
   node->games = 0;
@@ -2492,8 +2502,14 @@ uct_find_node(struct uct_tree *tree, struct uct_node *parent, int move)
     node = uct_init_node(tree, NULL);
     if (parent) {
       int aidx = __atomic_fetch_add(tree->p_used_arcs, 1, __ATOMIC_RELAXED);
-      if (aidx >= tree->num_arcs)
-	aidx = tree->num_arcs - 1;	/* capacity backstop */
+      if (aidx >= tree->num_arcs || node == &tree->overflow_node) {
+	/* Arc pool exhausted (or the node itself is the overflow scratch):
+	 * return the node UNLINKED rather than rewriting the last arc in
+	 * place -- two threads doing that on the same parent self-cycle its
+	 * child list and every later scan of it spins forever. */
+	pthread_mutex_unlock(plock);
+	return node;
+      }
       arc = &tree->arcs[aidx];
       arc->move = move;
       arc->node = node;
@@ -2600,6 +2616,27 @@ mc_vloss(void)
       mc_vloss_val = 1.0;
   }
   return mc_vloss_val;
+}
+
+/* WU-UCT (Liu et al., "Watch the Unobserved", ICLR 2020): in tree-parallel
+ * selection, count a thread's in-flight (incomplete) simulations only in the
+ * exploration/confidence terms, NOT in the value estimate.  Classic virtual
+ * loss treats in-flight visits as losses, pessimistically biasing the value;
+ * WU-UCT merely discounts confidence, which the paper shows preserves search
+ * quality to much higher worker counts.  GNUGO_MC_WU=1 enables (tree-parallel
+ * only); default 0 = classic virtual loss.  GNUGO_MC_VLOSS still weighs the
+ * in-flight count in either mode. */
+static int mc_wu_val = -1;
+static int
+mc_wu(void)
+{
+  if (mc_wu_val < 0) {
+    const char *v = getenv("GNUGO_MC_WU");
+    mc_wu_val = (v && *v) ? atoi(v) : 0;
+    if (mc_wu_val < 0)
+      mc_wu_val = 0;
+  }
+  return mc_wu_val;
 }
 
 /* Final root-move selection policy.  0 (default): highest-winrate child.  1:
@@ -2802,16 +2839,21 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
 		   float *gamma, int *move)
 {
   struct uct_arc *child_arc;
-  int base = (int) (node - tree->nodes) * BOARDMAX;
+  ptrdiff_t base = (node - tree->nodes) * (ptrdiff_t) BOARDMAX;
   /* GRAVE: read AMAF from the same-color reference ancestor if one exists on
    * this path, else fall back to this node's own AMAF (plain RAVE). Only the
    * RAVE term and untested-move ordering use it; UCT/winrate stay node-local. */
-  int gref = grave_enabled()
-	     ? tree->grave_ref_base[tree->game.color_to_move == WHITE] : -1;
-  int amaf_base = (gref >= 0) ? gref : base;
+  ptrdiff_t gref = grave_enabled()
+		   ? tree->grave_ref_base[tree->game.color_to_move == WHITE] : -1;
+  ptrdiff_t amaf_base = (gref >= 0) ? gref : base;
   const int *aw = tree->node_amaf_wins + amaf_base;
   const int *ag = tree->node_amaf_games + amaf_base;
-  float log_node_games = node->games > 0 ? log(node->games) : 0.0;
+  int wu = tree->parallel ? mc_wu() : 0;
+  /* WU-UCT: the parent's confidence budget also counts its in-flight sims. */
+  float parent_games = (float) node->games
+		       + (wu ? __atomic_load_n(&node->virtual_loss,
+					       __ATOMIC_RELAXED) : 0);
+  float log_node_games = parent_games > 0 ? log(parent_games) : 0.0;
   float untested_explore = rave_c * sqrt(log_node_games);
   struct mc_board *mc = &tree->game.mc;
   int color = tree->game.color_to_move;
@@ -2837,13 +2879,19 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
     int vl = tree->parallel
 	     ? __atomic_load_n(&child_node->virtual_loss, __ATOMIC_RELAXED) : 0;
     /* n can be 0 for a child another thread has just published (games==0) before
-     * it bumps virtual_loss; guard the divide so winrate is a finite 0, not NaN. */
+     * it bumps virtual_loss; guard the divide so winrate is a finite 0, not NaN.
+     * WU-UCT: in-flight sims discount confidence (n, used by exploration and
+     * the RAVE beta) but leave the value estimate (n_val) unbiased; classic
+     * virtual loss counts them as losses in both. */
     float n = (float) child_node->games + vloss * vl;
+    float n_val = wu ? (float) child_node->games : n;
     if (n <= 0.0)
       n = 1.0;
+    if (n_val <= 0.0)
+      n_val = 1.0;
     float winrate = shrink > 0.0
-		    ? (child_node->wins + 0.5 * shrink) / (n + shrink)
-		    : (float) child_node->wins / n;
+		    ? (child_node->wins + 0.5 * shrink) / (n_val + shrink)
+		    : (float) child_node->wins / n_val;
     /* Exploitation term: the max-entropy backup value when enabled, else the
      * plain Monte-Carlo mean.  best_winrate (the gamma early-cutoff below) stays
      * on the true mean so that logic is unchanged.  soft_w is only backed up on
@@ -2904,21 +2952,50 @@ uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
   struct uct_arc *best_winrate_arc = NULL;
   float best_uct_value = 0.0;
   float best_winrate = 0.0;
-  /* log(node->games) is constant across the child loop below; compute it
-   * once instead of calling log() per child (hot inner loop). Guard the
-   * root's first visit (games == 0): the value is unused when there are no
-   * children, but avoid evaluating log(0). */
-  float log_node_games = node->games > 0 ? log(node->games) : 0.0;
+  int wu;
+  float vloss;
+  float parent_games;
+  float log_node_games;
 
   if (rave_enabled())
     return uct_play_move_rave(tree, node, alpha, gamma, move);
 
-  for (child_arc = node->child; child_arc; child_arc = child_arc->next) {
+  /* Tree-parallel: same in-flight handling as the RAVE path -- classic
+   * virtual loss (in-flight sims count as losses) or, with GNUGO_MC_WU,
+   * WU-UCT (they only discount the exploration/confidence terms). */
+  wu = tree->parallel ? mc_wu() : 0;
+  vloss = tree->parallel ? mc_vloss() : 0.0;
+  parent_games = (float) node->games
+		 + (wu ? __atomic_load_n(&node->virtual_loss,
+					 __ATOMIC_RELAXED) : 0);
+  /* log(parent_games) is constant across the child loop below; compute it
+   * once instead of calling log() per child (hot inner loop). Guard the
+   * root's first visit (games == 0): the value is unused when there are no
+   * children, but avoid evaluating log(0). */
+  log_node_games = parent_games > 0 ? log(parent_games) : 0.0;
+
+  /* Acquire pairs with the release publish of new arcs in uct_find_node. */
+  child_arc = tree->parallel
+	      ? __atomic_load_n(&node->child, __ATOMIC_ACQUIRE) : node->child;
+  for (; child_arc; child_arc = child_arc->next) {
     struct uct_node *child_node = child_arc->node;
-    float winrate = (float) child_node->wins / child_node->games;
+    int vl = tree->parallel
+	     ? __atomic_load_n(&child_node->virtual_loss, __ATOMIC_RELAXED) : 0;
+    /* A child another thread has just published can still have games == 0;
+     * guard the divides so winrate/ratio are finite, not NaN/inf. */
+    float n = (float) child_node->games + vloss * vl;
+    float n_val = wu ? (float) child_node->games : n;
+    float winrate;
     float uct_value;
-    float log_games_ratio = log_node_games / child_node->games;
-    float x = winrate * (1.0 - winrate) + sqrt(2.0 * log_games_ratio);
+    float log_games_ratio;
+    float x;
+    if (n <= 0.0)
+      n = 1.0;
+    if (n_val <= 0.0)
+      n_val = 1.0;
+    winrate = (float) child_node->wins / n_val;
+    log_games_ratio = log_node_games / n;
+    x = winrate * (1.0 - winrate) + sqrt(2.0 * log_games_ratio);
     if (x < 0.25)
       x = 0.25;
     uct_value = winrate + sqrt(2 * log_games_ratio * x / (1 + tree->game.depth));
@@ -3011,7 +3088,8 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
     tree->grave_ref_base[1] = -1;
   }
   if (grave_enabled() && node->games >= grave_ref)
-    tree->grave_ref_base[color == WHITE] = (int) (node - tree->nodes) * BOARDMAX;
+    tree->grave_ref_base[color == WHITE] =
+      (node - tree->nodes) * (ptrdiff_t) BOARDMAX;
 
   /* FIXME: Unify these. */
   if (num_passes == 3 || tree->game.depth >= UCT_MAX_SEARCH_DEPTH
@@ -3078,7 +3156,7 @@ uct_traverse_tree(struct uct_tree *tree, struct uct_node *node,
    * perspective, matching child->wins. */
   if (rave_enabled()) {
     int player_won = ((result > 0) == (color == WHITE));
-    int base = (int) (node - tree->nodes) * BOARDMAX;
+    ptrdiff_t base = (node - tree->nodes) * (ptrdiff_t) BOARDMAX;
     int *aw = tree->node_amaf_wins + base;
     int *ag = tree->node_amaf_games + base;
     int final_depth = tree->game.depth;
@@ -3120,8 +3198,13 @@ uct_traverse_tree_parallel(struct uct_tree *tree, struct uct_node *node,
     tree->grave_ref_base[0] = -1;
     tree->grave_ref_base[1] = -1;
   }
-  if (grave_enabled() && node->games >= grave_ref)
-    tree->grave_ref_base[color == WHITE] = (int) (node - tree->nodes) * BOARDMAX;
+  /* The overflow scratch node is outside nodes[]: it has no AMAF row and its
+   * pointer offset is meaningless, so it must never become a GRAVE reference
+   * (nor take AMAF backups below). */
+  if (grave_enabled() && node != &tree->overflow_node
+      && node->games >= grave_ref)
+    tree->grave_ref_base[color == WHITE] =
+      (node - tree->nodes) * (ptrdiff_t) BOARDMAX;
 
   if (num_passes == 3 || tree->game.depth >= UCT_MAX_SEARCH_DEPTH
       || (node->games == 0 && node != tree->nodes)) {
@@ -3147,9 +3230,9 @@ uct_traverse_tree_parallel(struct uct_tree *tree, struct uct_node *node,
   node->sum_scores += result;			/* racy debug stats -- benign */
   node->sum_scores2 += result * result;
 
-  if (rave_enabled()) {
+  if (rave_enabled() && node != &tree->overflow_node) {
     int player_won = ((result > 0) == (color == WHITE));
-    int base = (int) (node - tree->nodes) * BOARDMAX;
+    ptrdiff_t base = (node - tree->nodes) * (ptrdiff_t) BOARDMAX;
     int *aw = tree->node_amaf_wins + base;
     int *ag = tree->node_amaf_games + base;
     int final_depth = tree->game.depth;
@@ -3426,6 +3509,7 @@ mc_prime_flag_caches(void)
   (void) mc_maxent();
   (void) mc_prior();
   (void) mc_vloss();
+  (void) mc_wu();
   (void) mc_robust();
   (void) mc_avoid_self_atari_enabled();
   (void) mc_mercy_margin();
