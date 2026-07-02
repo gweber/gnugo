@@ -2101,6 +2101,15 @@ mc_benson_owner(struct mc_board *mc, unsigned char *owner)
   mc_benson_color(mc, WHITE, owner);
 }
 
+static float mc_crit(void);		/* fwd: folding-inspired knobs, defined below */
+
+/* Per-point ownership map of the most recent fully-scored playout on THIS
+ * thread (+1 White owns, -1 Black owns), for the criticality accumulator.
+ * Only written when GNUGO_MC_CRIT is set; `valid` is cleared before a playout
+ * so the mercy-rule early return (which never scores per point) is detectable. */
+static __thread signed char mc_last_owner[BOARDMAX];
+static __thread int mc_last_owner_valid;
+
 /* Score the current playout position from White's perspective: +1 per White
  * point, -1 per Black point.  With GNUGO_MC_LD, Benson pass-alive ownership
  * overrides for the points it settles (dead groups -> the enclosing colour);
@@ -2111,6 +2120,7 @@ mc_score_game(struct mc_game *game)
   struct mc_board *mc = &game->mc;
   static __thread unsigned char benson_owner[BOARDMAX];	/* per-thread: scored on every worker */
   int use_ld = mc_ld_enabled();
+  int record_owner = mc_crit() > 0.0;	/* criticality wants per-point ownership */
   int score = 0;
   int pos;
   int k;
@@ -2120,14 +2130,15 @@ mc_score_game(struct mc_game *game)
 
   for (pos = BOARDMIN; pos < BOARDMAX; pos++)
     if (MC_ON_BOARD(pos)) {
+      int delta_score;
       if (use_ld && benson_owner[pos] == WHITE)
-	score++;
+	delta_score = 1;
       else if (use_ld && benson_owner[pos] == BLACK)
-	score--;
+	delta_score = -1;
       else if (game->settled[pos] == WHITE)
-	score++;
+	delta_score = 1;
       else if (game->settled[pos] == BLACK)
-	score--;
+	delta_score = -1;
       else {
 	int pos2 = pos;
 	if (mc->board[pos] == EMPTY)
@@ -2137,10 +2148,15 @@ mc_score_game(struct mc_game *game)
 	      break;
 	  }
 
-	score += 2 * (mc->board[pos2] == WHITE) - 1;
+	delta_score = 2 * (mc->board[pos2] == WHITE) - 1;
       }
+      score += delta_score;
+      if (record_owner)		/* +1 White owns, -1 Black owns */
+	mc_last_owner[pos] = (signed char) delta_score;
     }
 
+  if (record_owner)
+    mc_last_owner_valid = 1;
   return score;
 }
 
@@ -2185,6 +2201,8 @@ static int mc_play_random_game(struct mc_game *game)
   int move;
   int mercy = mc_mercy_margin();
   int since_check = 0;
+
+  mc_last_owner_valid = 0;	/* set by mc_score_game; stays 0 on mercy abort */
 
   /* First finish the game, if it isn't already. */
   while (game->consecutive_passes < 3) {
@@ -2268,6 +2286,15 @@ struct uct_tree {
   int parallel;
   int *p_used_nodes;
   int *p_used_arcs;
+  /* Folding-inspired knobs (tree-parallel only; NULL/1.0 => feature off, and
+   * the selection/backup code then takes exactly the original path). */
+  float temperature;		/* parallel tempering: this worker's UCT temp */
+  int *crit_sum_o;		/* criticality: shared [BOARDMAX], sum of owner */
+  int *crit_sum_oz;		/*   shared [BOARDMAX], sum of owner*outcome */
+  int *p_crit_n;		/*   shared scalar: playouts accumulated */
+  int *p_crit_sumz;		/*   shared scalar: sum of outcome */
+  int *msm_wins;		/* MSM: shared [MC_MSM_BUCKETS] cluster wins */
+  int *msm_games;		/*   shared [MC_MSM_BUCKETS] cluster visits */
   int amaf_ply[BOARDMAX];
   int *node_amaf_wins;
   int *node_amaf_games;
@@ -2639,6 +2666,118 @@ mc_wu(void)
   return mc_wu_val;
 }
 
+/* ---- Folding-inspired tree-parallel knobs (all default off) -----------------
+ *
+ * Three experiments borrowed from protein-structure prediction, where the same
+ * shape recurs: a globally-coupled system with local structure, optimised by
+ * Monte-Carlo.  All are tree-parallel-only (they pool statistics across the
+ * worker threads that share one tree) and allocate nothing unless enabled, so
+ * the serial and parallel-default code paths are byte-for-byte unchanged. */
+
+/* (1) Parallel tempering / replica exchange (molecular dynamics): run the
+ * shared-tree workers on a TEMPERATURE LADDER -- each worker scales its UCT
+ * exploration term by its own temperature, so the hot workers wander and the
+ * cold ones refine, all pooling into the one tree (the "exchange" is implicit
+ * through the shared statistics).  GNUGO_MC_TEMPER=S (S>1) spreads worker
+ * temperatures geometrically over [1/S, S]; unset/<=1 = off (all 1.0). */
+static float mc_temper_val = -1.0;
+static float
+mc_temper(void)
+{
+  if (mc_temper_val < 0.0) {
+    const char *v = getenv("GNUGO_MC_TEMPER");
+    mc_temper_val = (v && *v) ? (float) atof(v) : 0.0;
+    if (mc_temper_val < 1.0)
+      mc_temper_val = 0.0;		/* <=1 is a no-op ladder -> treat as off */
+  }
+  return mc_temper_val;
+}
+
+/* (2) Criticality (Coulom; the coevolution/contact-map analog): accumulate,
+ * per board point, the covariance between "the point is owned by the root
+ * player at game end" and "the root player wins the playout".  Points with
+ * high covariance are the ones actually deciding the game; add alpha*crit to
+ * the value of a move played there, biasing search toward the decisive region.
+ * A whole-board STATISTICAL signal, not a hard partition -- it does not delete
+ * the inter-region coupling.  GNUGO_MC_CRIT=alpha; unset/0 = off. */
+static float mc_crit_val = -1.0;
+static float
+mc_crit(void)
+{
+  if (mc_crit_val < 0.0) {
+    const char *v = getenv("GNUGO_MC_CRIT");
+    mc_crit_val = (v && *v) ? (float) atof(v) : 0.0;
+    if (mc_crit_val < 0.0)
+      mc_crit_val = 0.0;
+  }
+  return mc_crit_val;
+}
+
+/* (3) Markov-state-model value sharing (trajectory clustering, a la MSMBuilder;
+ * the acknowledged long shot -- M-MCTS without a CNN).  Cluster tree nodes into
+ * coarse "metastable states" by a cheap hand-crafted signature (game phase x
+ * material regime) and pool win rates per cluster, then blend the cluster mean
+ * into a node's value, RAVE-style, strongest when the node has few visits.  The
+ * memory-file caveat holds: the similarity metric is unvalidated without learned
+ * features, so this is expected weak.  GNUGO_MC_MSM=beta; unset/0 = off. */
+#define MC_MSM_PHASE_BINS  16
+#define MC_MSM_SCORE_BINS  15
+#define MC_MSM_BUCKETS     (MC_MSM_PHASE_BINS * MC_MSM_SCORE_BINS)
+static float mc_msm_val = -1.0;
+static float
+mc_msm(void)
+{
+  if (mc_msm_val < 0.0) {
+    const char *v = getenv("GNUGO_MC_MSM");
+    mc_msm_val = (v && *v) ? (float) atof(v) : 0.0;
+    if (mc_msm_val < 0.0)
+      mc_msm_val = 0.0;
+  }
+  return mc_msm_val;
+}
+
+/* Criticality of point m: covariance over accumulated playouts between the
+ * point's owner (+1 White, -1 Black) and the outcome z (+1 White win, -1 Black
+ * win).  Perspective-independent (cov(o,z) == cov(-o,-z)), so the same bonus
+ * applies to a move there for either colour: a decisive point is decisive for
+ * whoever contests it.  Returns 0 until enough data / when disabled. */
+static float
+mc_crit_value(struct uct_tree *tree, int m)
+{
+  int n;
+  float invn, eo, eoz, ez;
+  if (!tree->crit_sum_o)
+    return 0.0;
+  n = __atomic_load_n(tree->p_crit_n, __ATOMIC_RELAXED);
+  if (n <= 0)
+    return 0.0;
+  invn = 1.0f / n;
+  eo  = tree->crit_sum_o[m] * invn;
+  eoz = tree->crit_sum_oz[m] * invn;
+  ez  = __atomic_load_n(tree->p_crit_sumz, __ATOMIC_RELAXED) * invn;
+  return eoz - eo * ez;
+}
+
+/* MSM coarse cluster id for a node: (game phase = depth) x (material regime =
+ * quantised mean score margin).  Depth is kept exact for the low plies that
+ * dominate the search (so nodes in a bucket share ply parity, hence a
+ * consistent win perspective) and clamped for deep ones. */
+static int
+mc_msm_bucket(int depth, int games, float sum_scores)
+{
+  int pb = depth;
+  int sb;
+  float mean = games > 0 ? sum_scores / games : 0.0;
+  if (pb >= MC_MSM_PHASE_BINS)
+    pb = MC_MSM_PHASE_BINS - 1;
+  sb = (int) (mean * 0.5f) + MC_MSM_SCORE_BINS / 2;
+  if (sb < 0)
+    sb = 0;
+  else if (sb >= MC_MSM_SCORE_BINS)
+    sb = MC_MSM_SCORE_BINS - 1;
+  return pb * MC_MSM_SCORE_BINS + sb;
+}
+
 /* Final root-move selection policy.  0 (default): highest-winrate child.  1:
  * the ROBUST child (most visits, winrate tie-break) -- the standard MCTS choice
  * that avoids picking a child with a spuriously high winrate from very few
@@ -2865,6 +3004,14 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
   float shrink = mc_value_shrink();
   float maxent_tau = mc_maxent();
   float vloss = mc_vloss();
+  /* Folding-inspired knobs (tree-parallel; identity/no-op when unset). */
+  float temper = (tree->parallel && mc_temper() > 0.0) ? tree->temperature : 1.0;
+  float crit_alpha = tree->crit_sum_o ? mc_crit() : 0.0;
+  float msm_beta = tree->msm_games ? mc_msm() : 0.0;
+  int child_depth = tree->game.depth + 1;
+
+  if (temper != 1.0)
+    untested_explore *= temper;
 
   /* Score the existing children.  In tree-parallel mode load the list head with
    * an acquire to pair with the release publish in uct_find_node (older arcs are
@@ -2899,13 +3046,33 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
      * fall back to the true winrate there instead of collapsing exploit to 0. */
     float exploit = (maxent_tau > 0.0 && !tree->parallel) ? child_node->soft_w
 							  : winrate;
-    float value = exploit;
+    float value;
+    float explore;
+    /* MSM: blend the coarse cluster mean into the exploitation estimate,
+     * fading as this child accrues its own visits (gamma/best_winrate below
+     * stay on the true winrate). */
+    if (msm_beta > 0.0) {
+      int b = mc_msm_bucket(child_depth, child_node->games,
+			    child_node->sum_scores);
+      int bg = tree->msm_games[b];
+      if (bg > 0) {
+	float bw = (float) tree->msm_wins[b] / bg;
+	float w = msm_beta / (msm_beta + child_node->games);
+	exploit = (1.0 - w) * exploit + w * bw;
+      }
+    }
+    value = exploit;
     if (ON_BOARD(m) && ag[m] > 0) {
       float rave = (float) aw[m] / ag[m];
       float beta = sqrt(rave_equiv / (3.0 * n + rave_equiv));
       value = (1.0 - beta) * exploit + beta * rave;
     }
-    value += rave_c * sqrt(log_node_games / (n + 1.0));
+    explore = rave_c * sqrt(log_node_games / (n + 1.0));
+    if (temper != 1.0)
+      explore *= temper;
+    value += explore;
+    if (crit_alpha > 0.0 && ON_BOARD(m))
+      value += crit_alpha * mc_crit_value(tree, m);
     if (value > best_value) {
       best_value = value;
       best_arc = child_arc;
@@ -2956,6 +3123,11 @@ uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
   float vloss;
   float parent_games;
   float log_node_games;
+  /* Folding-inspired knobs (tree-parallel; identity/no-op when unset). */
+  float temper = (tree->parallel && mc_temper() > 0.0) ? tree->temperature : 1.0;
+  float crit_alpha = tree->crit_sum_o ? mc_crit() : 0.0;
+  float msm_beta = tree->msm_games ? mc_msm() : 0.0;
+  int child_depth = tree->game.depth + 1;
 
   if (rave_enabled())
     return uct_play_move_rave(tree, node, alpha, gamma, move);
@@ -2986,7 +3158,9 @@ uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
     float n = (float) child_node->games + vloss * vl;
     float n_val = wu ? (float) child_node->games : n;
     float winrate;
+    float sel_winrate;
     float uct_value;
+    float explore;
     float log_games_ratio;
     float x;
     if (n <= 0.0)
@@ -2994,11 +3168,30 @@ uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
     if (n_val <= 0.0)
       n_val = 1.0;
     winrate = (float) child_node->wins / n_val;
+    /* MSM: blend the coarse cluster mean into the value used for the
+     * exploration pick (not into best_winrate/gamma), fading as this child
+     * accrues its own visits. */
+    sel_winrate = winrate;
+    if (msm_beta > 0.0) {
+      int b = mc_msm_bucket(child_depth, child_node->games,
+			    child_node->sum_scores);
+      int bg = tree->msm_games[b];
+      if (bg > 0) {
+	float bw = (float) tree->msm_wins[b] / bg;
+	float w = msm_beta / (msm_beta + child_node->games);
+	sel_winrate = (1.0 - w) * winrate + w * bw;
+      }
+    }
     log_games_ratio = log_node_games / n;
     x = winrate * (1.0 - winrate) + sqrt(2.0 * log_games_ratio);
     if (x < 0.25)
       x = 0.25;
-    uct_value = winrate + sqrt(2 * log_games_ratio * x / (1 + tree->game.depth));
+    explore = sqrt(2 * log_games_ratio * x / (1 + tree->game.depth));
+    if (temper != 1.0)
+      explore *= temper;
+    uct_value = sel_winrate + explore;
+    if (crit_alpha > 0.0 && ON_BOARD(child_arc->move))
+      uct_value += crit_alpha * mc_crit_value(tree, child_arc->move);
     if (uct_value > best_uct_value) {
       next_arc = child_arc;
       best_uct_value = uct_value;
@@ -3211,6 +3404,24 @@ uct_traverse_tree_parallel(struct uct_tree *tree, struct uct_node *node,
     result = uct_finish_and_score_game(&tree->game);
     if (rave_enabled())
       uct_build_amaf(tree);
+    /* Criticality: fold this finished playout into the shared per-point
+     * owner/outcome covariance (once per simulation, at the scoring leaf).
+     * z = +1 if White won, owner = +1 White / -1 Black.  Lost updates from
+     * the non-atomic sum adds are a benign soft bias, but the scalar counts
+     * (n, sum_z) must stay consistent with them, so bump atomically. */
+    if (tree->crit_sum_o && mc_last_owner_valid) {
+      struct mc_board *mc = &tree->game.mc;	/* MC_ON_BOARD reads mc->board */
+      int z = (result > 0.0) ? 1 : -1;
+      int pos;
+      for (pos = BOARDMIN; pos < BOARDMAX; pos++)
+	if (MC_ON_BOARD(pos)) {
+	  int o = mc_last_owner[pos];
+	  tree->crit_sum_o[pos] += o;
+	  tree->crit_sum_oz[pos] += o * z;
+	}
+      __atomic_fetch_add(tree->p_crit_n, 1, __ATOMIC_RELAXED);
+      __atomic_fetch_add(tree->p_crit_sumz, z, __ATOMIC_RELAXED);
+    }
   }
   else {
     struct uct_node *next_node = uct_play_move(tree, node, alpha, &gamma, &move);
@@ -3229,6 +3440,16 @@ uct_traverse_tree_parallel(struct uct_tree *tree, struct uct_node *node,
   }
   node->sum_scores += result;			/* racy debug stats -- benign */
   node->sum_scores2 += result * result;
+
+  /* MSM: credit this node's outcome (from its parent's perspective -- the same
+   * bit as node->wins above) to its coarse cluster, so low-visit nodes in the
+   * same phase/material regime can borrow the pooled mean.  Racy adds benign. */
+  if (tree->msm_games && node != &tree->overflow_node) {
+    int b = mc_msm_bucket(node_depth, node->games, node->sum_scores);
+    tree->msm_games[b]++;
+    if ((result > 0) ^ (color == WHITE))
+      tree->msm_wins[b]++;
+  }
 
   if (rave_enabled() && node != &tree->overflow_node) {
     int player_won = ((result > 0) == (color == WHITE));
@@ -3309,6 +3530,14 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
   struct uct_arc *shared_arcs = malloc((size_t) total * sizeof(*shared_arcs));
   int *shared_amaf_w = NULL;
   int *shared_amaf_g = NULL;
+  /* Folding-inspired shared state (allocated only when the knob is on). */
+  float temper = mc_temper();
+  int *crit_sum_o = NULL;
+  int *crit_sum_oz = NULL;
+  int crit_n = 0;
+  int crit_sumz = 0;
+  int *msm_wins = NULL;
+  int *msm_games = NULL;
   int used_nodes = 0;
   int used_arcs = 0;
   struct uct_tree *views = calloc(nthreads, sizeof(*views));
@@ -3325,6 +3554,16 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
     shared_amaf_g = calloc((size_t) total * BOARDMAX, sizeof(int));
     gg_assert(shared_amaf_w && shared_amaf_g);
   }
+  if (mc_crit() > 0.0) {
+    crit_sum_o  = calloc(BOARDMAX, sizeof(int));
+    crit_sum_oz = calloc(BOARDMAX, sizeof(int));
+    gg_assert(crit_sum_o && crit_sum_oz);
+  }
+  if (mc_msm() > 0.0) {
+    msm_wins  = calloc(MC_MSM_BUCKETS, sizeof(int));
+    msm_games = calloc(MC_MSM_BUCKETS, sizeof(int));
+    gg_assert(msm_wins && msm_games);
+  }
   uct_locks_init();
 
   for (t = 0; t < nthreads; t++) {
@@ -3339,6 +3578,20 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
     v->parallel = 1;
     v->p_used_nodes = &used_nodes;
     v->p_used_arcs = &used_arcs;
+    /* Parallel tempering: geometric ladder over [1/S, S] across the workers,
+     * so worker 0 is coldest (exploit) and the last is hottest (explore).  A
+     * single worker (or temper off) gets 1.0. */
+    v->temperature = 1.0;
+    if (temper > 0.0 && nthreads > 1) {
+      float f = (float) t / (nthreads - 1);	/* 0 .. 1 */
+      v->temperature = (float) exp((2.0 * f - 1.0) * log(temper));
+    }
+    v->crit_sum_o = crit_sum_o;
+    v->crit_sum_oz = crit_sum_oz;
+    v->p_crit_n = &crit_n;
+    v->p_crit_sumz = &crit_sumz;
+    v->msm_wins = msm_wins;
+    v->msm_games = msm_games;
     v->hashtable_odd = NULL;
     v->hashtable_even = NULL;
     v->hashtable_size = 0;
@@ -3396,6 +3649,10 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
   free(shared_arcs);
   free(shared_amaf_w);
   free(shared_amaf_g);
+  free(crit_sum_o);
+  free(crit_sum_oz);
+  free(msm_wins);
+  free(msm_games);
   free(views);
   free(threads);
   free(args);
@@ -3510,6 +3767,9 @@ mc_prime_flag_caches(void)
   (void) mc_prior();
   (void) mc_vloss();
   (void) mc_wu();
+  (void) mc_temper();
+  (void) mc_crit();
+  (void) mc_msm();
   (void) mc_robust();
   (void) mc_avoid_self_atari_enabled();
   (void) mc_mercy_margin();
@@ -3536,6 +3796,15 @@ uct_tree_alloc(struct uct_tree *tree, int nodes)
   tree->parallel = 0;
   tree->node_amaf_wins = NULL;
   tree->node_amaf_games = NULL;
+  /* Folding-inspired knobs are tree-parallel-only: leave them inert here so
+   * the selection/backup guards (pointer != NULL) take the original path. */
+  tree->temperature = 1.0;
+  tree->crit_sum_o = NULL;
+  tree->crit_sum_oz = NULL;
+  tree->p_crit_n = NULL;
+  tree->p_crit_sumz = NULL;
+  tree->msm_wins = NULL;
+  tree->msm_games = NULL;
   if (rave_enabled()) {
     tree->node_amaf_wins = calloc((size_t) nodes * BOARDMAX, sizeof(int));
     tree->node_amaf_games = calloc((size_t) nodes * BOARDMAX, sizeof(int));
@@ -3748,6 +4017,13 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
   tree.num_used_nodes = 0;
   tree.num_used_arcs = 0;
   tree.parallel = 0;
+  tree.temperature = 1.0;	/* folding knobs inert on the single-thread path */
+  tree.crit_sum_o = NULL;
+  tree.crit_sum_oz = NULL;
+  tree.p_crit_n = NULL;
+  tree.p_crit_sumz = NULL;
+  tree.msm_wins = NULL;
+  tree.msm_games = NULL;
   tree.forbidden_moves = forbidden_moves;
   /* Per-node AMAF tables for RAVE: one [BOARDMAX] row per node.  Allocated
    * only when RAVE is enabled; calloc + demand paging keeps resident memory
