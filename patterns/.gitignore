@@ -28,3 +28,9 @@ handipat.c
 oraclepat.c
 mkmcpat
 mcpat.c
+# Compiled MC ML/diagnostic tools — .c sources are tracked; binaries are build output.
+mccalib
+mcdiff
+mcpredict
+mctrain
+__pycache__/
