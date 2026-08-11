@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# GTP wrapper for the CGOS 9x9 bot saigo.gnugo3.9.1.
+# GTP wrapper for the CGOS 9x9 bot saigo.gnugo3.9.1b (b = KataGo-derived
+# fuseki book, +60 +/- 38 SPRT-measured; commit a3c96ced).
 #
-# Runs the SNAPSHOTTED binary (gnugo-3.9.1-bin, copied at deploy time), never
+# Runs the SNAPSHOTTED binary (gnugo-3.9.1b-bin, copied at deploy time), never
 # interface/gnugo directly: in-tree rebuilds must not swap the engine under a
 # live rated game.  Re-snapshot deliberately with:
-#   cp ../interface/gnugo gnugo-3.9.1-bin   (while the bot is between games)
+#   cp ../interface/gnugo gnugo-3.9.1b-bin   (while the bot is between games)
 #
 # Config: the measured-strongest NON-experimental MC stack --
 #   tree-parallel 4 threads (+237 over root-par), tuned RAVE (+92),
@@ -25,6 +26,6 @@ exec env \
   GNUGO_MC_AVOID_SELFATARI=1 \
   GNUGO_MC_LCB=1.28 \
   GNUGO_MC_TREE_THREADS=4 \
-  ./gnugo-3.9.1-bin --mode gtp --monte-carlo \
+  ./gnugo-3.9.1b-bin --mode gtp --monte-carlo \
     --chinese-rules --positional-superko --capture-all-dead \
     --level 8 --min-level 2 --max-level 12

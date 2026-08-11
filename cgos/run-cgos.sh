@@ -13,7 +13,7 @@ cd "$(dirname "$0")"
 CREDS="${CGOS_CREDS:-/home/taro/code/archive/mushin-go/training-jax/.cgos_env}"
 [ -f "$CREDS" ] && source "$CREDS"
 : "${CGOS_PASSWORD:?CGOS_PASSWORD not set (source $CREDS)}"
-NAME="${CGOS_NAME:-saigo.gnugo3.9.1}"
+NAME="${CGOS_NAME:-saigo.gnugo3.9.1b}"
 SERVER="${CGOS_SERVER:-yss-aya.com}"; PORT="${CGOS_PORT:-6809}"
 WRAP="$(pwd)/gnugo-cgos9-gtp.sh"
 CLIENT=/home/taro/code/CGOS/client/cgosGtp.tcl
