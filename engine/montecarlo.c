@@ -2796,6 +2796,332 @@ mc_robust(void)
   return mc_robust_val;
 }
 
+/* LCB final root-move selection (Leela Zero #2282, adopted by KataGo): pick
+ * the child maximizing a lower confidence bound  wr - z*sqrt(wr*(1-wr)/n)  on
+ * the RAW Monte-Carlo winrate -- never the RAVE-blended selection value --
+ * among children with at least MC_LCB_MIN_VISIT_FRACTION of the maximum visit
+ * count (fewer visits make the bound meaninglessly wide, and a visit floor is
+ * what keeps this from re-opening the low-visit-winrate trap GNUGO_MC_ROBUST
+ * exists for).  GNUGO_MC_LCB = z, e.g. 1.28 ~ a one-sided 90% bound; 0/unset
+ * = off.  When set it overrides GNUGO_MC_ROBUST's choice. */
+#define MC_LCB_MIN_VISIT_FRACTION 0.10f
+static float mc_lcb_z = -1.0f;
+static float
+mc_lcb(void)
+{
+  if (mc_lcb_z < 0.0f) {
+    const char *v = getenv("GNUGO_MC_LCB");
+    mc_lcb_z = (v && *v) ? (float) atof(v) : 0.0f;
+    if (mc_lcb_z < 0.0f)
+      mc_lcb_z = 0.0f;
+  }
+  return mc_lcb_z;
+}
+
+/* Apply LCB selection over the per-move (winrate, visits) stats every search
+ * path has already written into move_values/move_frequencies for this move
+ * (the arrays are zeroed by the caller, so nonzero frequency == root child).
+ * Returns the LCB pick, or PASS_MOVE if no child clears the visit floor. */
+static int
+mc_lcb_choose(const float *move_values, const int *move_frequencies,
+	      int max_games)
+{
+  float z = mc_lcb();
+  int visit_floor = (int) (MC_LCB_MIN_VISIT_FRACTION * (float) max_games);
+  int pos;
+  int best_pos = PASS_MOVE;
+  float best_lcb = -1.0f;
+  if (visit_floor < 1)
+    visit_floor = 1;
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
+    int n = move_frequencies[pos];
+    float wr, lcb;
+    if (!ON_BOARD(pos) || n < visit_floor)
+      continue;
+    wr = move_values[pos];
+    lcb = wr - z * (float) sqrt(wr * (1.0f - wr) / (float) n);
+    if (lcb > best_lcb) {
+      best_lcb = lcb;
+      best_pos = pos;
+    }
+  }
+  return best_pos;
+}
+
+/* ------------------- Tree reuse across genmoves (GNUGO_MC_REUSE) ------------
+ *
+ * Standard MCTS tree reuse (Pachi/Fuego ship it always-on): instead of
+ * starting every search cold, keep the subtree under the move we play, and if
+ * the game continues with one of its explored replies, seed the next search
+ * from the matching grandchild subtree -- its visit counts, winrates and
+ * expanded structure are all still valid, so the new search starts where the
+ * old one left off.
+ *
+ * Mechanics: at the end of a genmove the chosen child's subtree is deep-copied
+ * into a private cache (the live pools are freed each move); at the start of
+ * the next genmove the opponent's reply selects a child of the cached root,
+ * and if that node's stored board hash equals the CURRENT board hash (and the
+ * colors line up) the subtree is copied into the fresh pool under the new
+ * root.  The hash check makes staleness structurally impossible: undo, new
+ * game, non-alternating play or any board divergence just misses and the
+ * search starts cold, exactly as before.
+ *
+ * Scope and deliberate simplifications:
+ *  - Applies to the single-thread and tree-parallel paths.  Root-parallel
+ *    keeps N independent trees whose stats are only merged at the root, so a
+ *    warm start would need per-thread subtree copies for dubious gain; it
+ *    stays cold (and never stores, so the flag is inert there).
+ *  - RAVE/AMAF rows are NOT cached: they are [BOARDMAX]-sized per node, so
+ *    copying them would blow the cache up ~100x for what is only a soft
+ *    move-ordering hint.  Grafted nodes restart with zeroed AMAF, exactly
+ *    like fresh nodes.
+ *  - In the single-thread path grafted nodes are not entered into the
+ *    transposition table (it only serves expansion of NEW moves; grafted
+ *    children are reached through their arcs, and their untested bits are
+ *    already cleared, so expansion never targets them.  A transposition
+ *    elsewhere in the tree may duplicate a grafted position's node, which
+ *    only splits its statistics -- the pre-reuse behaviour for fresh nodes).
+ *  - Deep nodes carry untested bitboards computed under the PREVIOUS root's
+ *    forbidden-move list; the root's own untested set is rebuilt fresh.
+ *    Superko-induced differences deep in the tree are noise-level.
+ *  - The copy is bounded by the cache capacity and by half of the new pool
+ *    (the search needs headroom to grow); children are copied in list order
+ *    and the remainder dropped -- a dropped subtree is just a cold start for
+ *    that line. */
+#define MC_REUSE_CACHE_NODES 65536
+
+static int mc_reuse_val = -1;
+static int
+mc_reuse(void)
+{
+  if (mc_reuse_val < 0) {
+    const char *v = getenv("GNUGO_MC_REUSE");
+    mc_reuse_val = (v && *v) ? atoi(v) : 0;
+    if (mc_reuse_val < 0)
+      mc_reuse_val = 0;
+  }
+  return mc_reuse_val;
+}
+
+static struct {
+  struct uct_node *nodes;	/* [MC_REUSE_CACHE_NODES]; [0] is the root */
+  struct uct_arc *arcs;		/* [MC_REUSE_CACHE_NODES] */
+  int used_nodes;
+  int used_arcs;
+  int root_color;		/* color to move at nodes[0]'s position */
+  int history_pointer;		/* move_history_pointer at store time */
+  int have;			/* cache holds a valid subtree */
+} mc_reuse_cache;
+
+/* Deep-copy src's children (live tree -> cache).  Returns 0 when the cache
+ * is full, in which case the remaining children are dropped. */
+static int
+mc_reuse_copy_out(const struct uct_node *src, struct uct_node *dst)
+{
+  const struct uct_arc *sarc;
+  for (sarc = src->child; sarc; sarc = sarc->next) {
+    struct uct_node *child;
+    struct uct_arc *arc;
+    if (sarc->node->games <= 0)		/* nothing learned; not worth a slot */
+      continue;
+    if (mc_reuse_cache.used_nodes >= MC_REUSE_CACHE_NODES
+	|| mc_reuse_cache.used_arcs >= MC_REUSE_CACHE_NODES)
+      return 0;
+    child = &mc_reuse_cache.nodes[mc_reuse_cache.used_nodes++];
+    arc = &mc_reuse_cache.arcs[mc_reuse_cache.used_arcs++];
+    *child = *sarc->node;
+    child->child = NULL;
+    child->virtual_loss = 0;
+    arc->move = sarc->move;
+    arc->node = child;
+    arc->next = dst->child;
+    dst->child = arc;
+    if (!mc_reuse_copy_out(sarc->node, child))
+      return 0;
+  }
+  return 1;
+}
+
+/* Store the whole root subtree into the cache.  The move actually played
+ * is not known here -- genmove.c may override the UCT choice with a
+ * classical-prior pick -- so the graft descends from the root along the
+ * REAL move history instead.  Main thread only, after all workers joined. */
+static void
+mc_reuse_store(struct uct_tree *tree, struct uct_node *root)
+{
+  if (!mc_reuse())
+    return;
+  mc_reuse_cache.have = 0;
+  mc_reuse_cache.used_nodes = 0;
+  mc_reuse_cache.used_arcs = 0;
+
+  if (root->games <= 0)
+    return;
+
+  if (!mc_reuse_cache.nodes) {
+    mc_reuse_cache.nodes = malloc(MC_REUSE_CACHE_NODES
+				  * sizeof(*mc_reuse_cache.nodes));
+    mc_reuse_cache.arcs = malloc(MC_REUSE_CACHE_NODES
+				 * sizeof(*mc_reuse_cache.arcs));
+    if (!mc_reuse_cache.nodes || !mc_reuse_cache.arcs) {
+      free(mc_reuse_cache.nodes);
+      free(mc_reuse_cache.arcs);
+      mc_reuse_cache.nodes = NULL;
+      mc_reuse_cache.arcs = NULL;
+      return;				/* no cache, no reuse -- just cold */
+    }
+  }
+
+  mc_reuse_cache.nodes[0] = *root;
+  mc_reuse_cache.nodes[0].child = NULL;
+  mc_reuse_cache.nodes[0].virtual_loss = 0;
+  mc_reuse_cache.used_nodes = 1;
+  mc_reuse_copy_out(root, &mc_reuse_cache.nodes[0]);
+  mc_reuse_cache.root_color = tree->root_color;
+  mc_reuse_cache.history_pointer = move_history_pointer;
+  mc_reuse_cache.have = 1;
+  if (getenv("GNUGO_MC_REUSE_DEBUG"))
+    fprintf(stderr, "reuse: stored %d nodes at history %d\n",
+	    mc_reuse_cache.used_nodes, mc_reuse_cache.history_pointer);
+}
+
+/* Allocate a node/arc pair from the live tree's pool (main thread, before
+ * any worker starts, so plain increments are safe even on the shared
+ * tree-parallel cursors).  NULL when the graft budget is exhausted. */
+static struct uct_node *
+mc_reuse_alloc(struct uct_tree *tree, struct uct_arc **arc_out)
+{
+  int nidx, aidx;
+  int node_budget = tree->num_nodes / 2;
+  int arc_budget = tree->num_arcs / 2;
+  int used_nodes = tree->parallel ? *tree->p_used_nodes
+				  : tree->num_used_nodes;
+  int used_arcs = tree->parallel ? *tree->p_used_arcs
+				 : tree->num_used_arcs;
+  if (used_nodes >= node_budget || used_arcs >= arc_budget)
+    return NULL;
+  if (tree->parallel) {
+    nidx = (*tree->p_used_nodes)++;
+    aidx = (*tree->p_used_arcs)++;
+  }
+  else {
+    nidx = tree->num_used_nodes++;
+    aidx = tree->num_used_arcs++;
+  }
+  *arc_out = &tree->arcs[aidx];
+  return &tree->nodes[nidx];
+}
+
+/* Deep-copy src's children (cache -> live tree) under dst. */
+static void
+mc_reuse_copy_in(struct uct_tree *tree, struct uct_node *dst,
+		 const struct uct_node *src)
+{
+  const struct uct_arc *sarc;
+  for (sarc = src->child; sarc; sarc = sarc->next) {
+    struct uct_arc *arc;
+    struct uct_node *child = mc_reuse_alloc(tree, &arc);
+    if (!child)
+      return;
+    *child = *sarc->node;
+    child->child = NULL;
+    child->virtual_loss = 0;
+    arc->move = sarc->move;
+    arc->node = child;
+    arc->next = dst->child;
+    dst->child = arc;
+    mc_reuse_copy_in(tree, child, sarc->node);
+  }
+}
+
+/* Seed the fresh root from the cache if the opponent's reply leads to a
+ * cached subtree for EXACTLY the current position.  Call right after the
+ * root node is initialised, before any simulation runs. */
+static void
+mc_reuse_graft(struct uct_tree *tree, struct uct_node *root)
+{
+  struct uct_arc *arc;
+  struct uct_node *src;
+  int k;
+
+  int reuse_debug = getenv("GNUGO_MC_REUSE_DEBUG") != NULL;
+  if (!mc_reuse() || !mc_reuse_cache.have) {
+    if (reuse_debug && mc_reuse())
+      fprintf(stderr, "reuse: miss (no cache)\n");
+    return;
+  }
+  /* One or two real moves since the cached search, alternating colors from
+   * the cached root's mover, ending with the new root's mover to play.
+   * Two = normal match play (our move, then the reply); one = the engine
+   * searches for both sides (self-play GTP, twogtp) and the tree one ply
+   * down is equally valid for the other color.  Undo, new game or any
+   * non-alternating sequence falls out here. */
+  {
+    int delta = move_history_pointer - mc_reuse_cache.history_pointer;
+    int c = mc_reuse_cache.root_color;
+    if (delta < 1 || delta > 2) {
+      if (reuse_debug)
+	fprintf(stderr, "reuse: miss (history %d -> %d)\n",
+		mc_reuse_cache.history_pointer, move_history_pointer);
+      return;
+    }
+    for (k = 0; k < delta; k++) {
+      if (move_history_color[mc_reuse_cache.history_pointer + k] != c) {
+	if (reuse_debug)
+	  fprintf(stderr, "reuse: miss (color at ply %d)\n", k);
+	return;
+      }
+      c = OTHER_COLOR(c);
+    }
+    if (tree->root_color != c) {
+      if (reuse_debug)
+	fprintf(stderr, "reuse: miss (root color)\n");
+      return;
+    }
+    /* Descend the cached tree along the move(s) actually played. */
+    src = &mc_reuse_cache.nodes[0];
+    for (k = 0; k < delta; k++) {
+      int move = move_history_pos[mc_reuse_cache.history_pointer + k];
+      struct uct_node *next = NULL;
+      for (arc = src->child; arc; arc = arc->next)
+	if (arc->move == move) {
+	  next = arc->node;
+	  break;
+	}
+      if (!next) {
+	if (reuse_debug)
+	  fprintf(stderr, "reuse: miss (move %d of ply %d not cached)\n",
+		  move, k);
+	return;
+      }
+      src = next;
+    }
+  }
+  if (!hashdata_is_equal(src->boardhash, tree->game.mc.hash)) {
+    if (reuse_debug)
+      fprintf(stderr, "reuse: miss (hash %lx vs %lx)\n",
+	      (unsigned long) src->boardhash.hashval[0],
+	      (unsigned long) tree->game.mc.hash.hashval[0]);
+    return;
+  }
+
+  root->wins = src->wins;
+  root->games = src->games;
+  root->sum_scores = src->sum_scores;
+  root->sum_scores2 = src->sum_scores2;
+  root->soft_w = src->soft_w;
+  mc_reuse_copy_in(tree, root, src);
+  /* A grafted child is an already-tried move: clear its untested bit so
+   * expansion never re-creates it (matching what uct_play_move* do). */
+  for (arc = root->child; arc; arc = arc->next)
+    if (arc->move >= 0 && arc->move < BOARDMAX)
+      root->untested.bits[arc->move / 32] &= ~(1 << (arc->move % 32));
+  if (getenv("GNUGO_MC_REUSE_DEBUG"))
+    fprintf(stderr, "reuse: warm start with %d games, %d nodes\n",
+	    root->games,
+	    tree->parallel ? *tree->p_used_nodes : tree->num_used_nodes);
+}
+
 static void
 uct_init_move_ordering(struct uct_tree *tree)
 {
@@ -3605,6 +3931,7 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
   /* Initialise the shared root (index 0) once, before any worker runs. */
   uct_init_node(&views[0], allowed_moves);
   root = &shared_nodes[0];
+  mc_reuse_graft(&views[0], root);
 
   for (t = 0; t < nthreads; t++) {
     args[t].view = &views[t];
@@ -3643,7 +3970,14 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
     }
     if (robust && robust_move != PASS_MOVE)
       *move = robust_move;
+    if (mc_lcb() > 0.0f) {
+      int lcb_move = mc_lcb_choose(move_values, move_frequencies, best_games);
+      if (lcb_move != PASS_MOVE)
+	*move = lcb_move;
+    }
   }
+
+  mc_reuse_store(&views[0], root);
 
   free(shared_nodes);
   free(shared_arcs);
@@ -3771,6 +4105,8 @@ mc_prime_flag_caches(void)
   (void) mc_crit();
   (void) mc_msm();
   (void) mc_robust();
+  (void) mc_lcb();
+  (void) mc_reuse();
   (void) mc_avoid_self_atari_enabled();
   (void) mc_mercy_margin();
   (void) lgrf_enabled();
@@ -3929,6 +4265,11 @@ uct_genmove_parallel(int nthreads, struct mc_game *starting_position,
     }
     if (robust && robust_move != PASS_MOVE)
       *move = robust_move;
+    if (mc_lcb() > 0.0f) {
+      int lcb_move = mc_lcb_choose(move_values, move_frequencies, best_games);
+      if (lcb_move != PASS_MOVE)
+	*move = lcb_move;
+    }
   }
 
   for (t = 0; t < nthreads; t++)
@@ -4037,6 +4378,7 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
   }
   uct_init_node(&tree, allowed_moves);
   uct_init_move_ordering(&tree);
+  mc_reuse_graft(&tree, &tree.nodes[0]);
 
   /* Play simulations. FIXME: Terribly dirty fix. */
   while (tree.num_used_arcs < tree.num_arcs - 10) {
@@ -4079,6 +4421,11 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
     }
     if (robust && robust_move != PASS_MOVE)
       *move = robust_move;
+    if (mc_lcb() > 0.0f) {
+      int lcb_move = mc_lcb_choose(move_values, move_frequencies, best_games);
+      if (lcb_move != PASS_MOVE)
+	*move = lcb_move;
+    }
   }
 
   /* Dump sgf tree of the significant part of the search tree. */
@@ -4146,6 +4493,8 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
     }
   }
   
+  mc_reuse_store(&tree, &tree.nodes[0]);
+
   free(tree.nodes);
   free(tree.arcs);
   free(tree.hashtable_odd);
