@@ -17,20 +17,16 @@
 #include "gnugo.h"
 #include "liberty.h"
 #include "patterns.h"
-
-/* tugo's sound L&D oracle (FFI): per-point ownership with df-pn reading.
- * cells/out length n*n row-major; 0=empty/unknown, 1=black, 2=white. */
-extern void tugo_ownership_ld(const unsigned char *cells, size_t n,
-			      unsigned long ld_budget, unsigned char *out);
+#include "mcpos.h"
 
 int
 main(int argc, char **argv)
 {
   FILE *f;
   int M;
-  char ctm[4], col[4];
+  char ctm[4];
   double target;
-  int nstones, r, c, i;
+  int i;
 
   if (argc < 3) {
     fprintf(stderr, "usage: %s <positions.txt> <playouts_per_pos>\n", argv[0]);
@@ -54,15 +50,11 @@ main(int argc, char **argv)
   int use_ld = (argc > 4 && strcmp(argv[3], "ld") == 0);
   unsigned long ld_budget = use_ld ? strtoul(argv[4], NULL, 10) : 0;
   unsigned char cells[81], own[81], settled[BOARDMAX];
-  while (fscanf(f, "%lf %3s %d", &target, ctm, &nstones) == 3) {
+  int npos = 0;
+  while (mc_read_position(f, &target, ctm, npos + 1)) {
     int ctm_color = (ctm[0] == 'B') ? BLACK : WHITE;
     float vth;
-    gnugo_clear_board(9);
-    for (i = 0; i < nstones; i++) {
-      if (fscanf(f, "%d %d %3s", &r, &c, col) != 3)
-	break;
-      add_stone(POS(r, c), (col[0] == 'B') ? BLACK : WHITE);
-    }
+    npos++;
     if (use_estimate) {
       /* GNU Go's own dragon/L&D-aware score estimate. score>=0 => White ahead. */
       float ub, lb;
@@ -71,14 +63,10 @@ main(int argc, char **argv)
       vth = ctm_wins ? 1.0 : 0.0;
     }
     else if (use_ld) {
-      /* Settle proven dead/alive points with tugo's oracle, then play the rest. */
+      /* Settle proven dead/alive points with saigo's oracle, then play the rest. */
       int rr, cc;
-      for (rr = 0; rr < 9; rr++)
-	for (cc = 0; cc < 9; cc++) {
-	  int b = board[POS(rr, cc)];
-	  cells[rr * 9 + cc] = (b == BLACK) ? 1 : (b == WHITE) ? 2 : 0;
-	}
-      tugo_ownership_ld(cells, 9, ld_budget, own);
+      mc_board_to_cells(cells);
+      saigo_ownership_ld(cells, 9, ld_budget, own);
       for (i = 0; i < BOARDMAX; i++)
 	settled[i] = 0;
       for (rr = 0; rr < 9; rr++)
