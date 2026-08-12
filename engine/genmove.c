@@ -373,6 +373,15 @@ monte_carlo_genmove(int color, int allowed_moves[BOARDMAX],
 
   best_move = best_uct_move;
   best_value = 0.0;
+  /* GNUGO_MC_NO_OVERRIDE=1 keeps the pure UCT/LCB choice: the classical
+   * override below predates LCB root selection and has never been measured
+   * in isolation -- this flag prices it (and, with GNUGO_MC_PRIOR=0, the
+   * whole classical coupling except the fuseki book). */
+  {
+    const char *no_ovr = getenv("GNUGO_MC_NO_OVERRIDE");
+    if (no_ovr && *no_ovr && atoi(no_ovr) > 0)
+      goto skip_classical_override;
+  }
   frequency_cutoff = move_frequencies[best_uct_move] / 2;
   frequency_cutoff2 = move_frequencies[best_uct_move] / 10;
   for (pos = BOARDMIN; pos < BOARDMAX; pos++) {
@@ -391,6 +400,7 @@ monte_carlo_genmove(int color, int allowed_moves[BOARDMAX],
     }
   }
 
+skip_classical_override:
   unconditionally_meaningless_move(best_move, color, &best_move);
 
   *value = 1.0;
@@ -423,7 +433,9 @@ ponder_main(void *arg)
   float value;
   int resign;
   UNUSED(arg);
+  mc_set_in_ponder(1);		/* early-stop must not curtail free time */
   monte_carlo_genmove(ponder_color, NULL, &value, &resign);
+  mc_set_in_ponder(0);
   return NULL;			/* move discarded; the tree is the product */
 }
 

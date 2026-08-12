@@ -2929,6 +2929,82 @@ mc_clear_search_abort(void)
   mc_search_abort = 0;
 }
 
+/* Within-move early stop (Baier & Winands' EARLY-C): once the most-visited
+ * root child's lead over the runner-up exceeds the simulations that remain,
+ * the visit ranking can no longer change, and if that child also has the
+ * better winrate no selection policy (max-winrate, robust, LCB) flips
+ * either -- further simulation cannot alter the move.  Stopping then costs
+ * nothing at fixed sims and SAVES CLOCK under time controls: with the
+ * autolevel schedule the saved seconds flow into later, harder moves.
+ * GNUGO_MC_EARLYSTOP=margin scales the required lead (1.0 = the exact
+ * bound, <1 stops sooner and is no longer loss-free); 0/unset = off.
+ * Never fires during pondering (there the idle time is free anyway and a
+ * deeper tree is always welcome). */
+static float mc_earlystop_val = -1.0f;
+static float
+mc_earlystop(void)
+{
+  if (mc_earlystop_val < 0.0f) {
+    const char *v = getenv("GNUGO_MC_EARLYSTOP");
+    mc_earlystop_val = (v && *v) ? (float) atof(v) : 0.0f;
+    if (mc_earlystop_val < 0.0f)
+      mc_earlystop_val = 0.0f;
+  }
+  return mc_earlystop_val;
+}
+
+static volatile int mc_in_ponder = 0;
+
+void
+mc_set_in_ponder(int flag)
+{
+  mc_in_ponder = flag;
+}
+
+/* Separate from mc_search_abort: pondering's stop must never be un-set by
+ * a search that is just starting (the ponder thread may be between its
+ * spawn and its uct_genmove entry when the stop arrives), so early-stop
+ * gets its own flag, cleared at the start of every search. */
+static volatile int mc_earlystop_hit = 0;
+
+/* Decide whether the search may stop `remaining` simulations early.
+ * Main criterion as above; reads of the shared tree are racy in the
+ * tree-parallel case but only ever cause a late or missed stop, never an
+ * incorrect move (the final selection re-reads consistent totals after
+ * the join). */
+static int
+mc_earlystop_decided(struct uct_node *root, int remaining)
+{
+  float margin = mc_earlystop();
+  struct uct_arc *arc;
+  int best_games = -1, second_games = -1;
+  int best_wins = 0;
+  float best_wr = -1.0f, second_wr = -1.0f;
+  if (margin <= 0.0f || mc_in_ponder)
+    return 0;
+  for (arc = root->child; arc; arc = arc->next) {
+    struct uct_node *node = arc->node;
+    int g = node->games;
+    float wr = g > 0 ? (float) node->wins / g : 0.0f;
+    if (g > best_games) {
+      second_games = best_games;
+      second_wr = best_wr;
+      best_games = g;
+      best_wins = node->wins;
+      best_wr = wr;
+    }
+    else if (g > second_games) {
+      second_games = g;
+      second_wr = wr;
+    }
+  }
+  UNUSED(best_wins);
+  if (second_games < 0)
+    return 0;
+  return (float) (best_games - second_games) > margin * (float) remaining
+	 && best_wr >= second_wr;
+}
+
 static struct {
   struct uct_node *nodes;	/* [MC_REUSE_CACHE_NODES]; [0] is the root */
   struct uct_arc *arcs;		/* [MC_REUSE_CACHE_NODES] */
@@ -3919,6 +3995,7 @@ mc_num_tree_threads(void)
 }
 
 struct uct_tree_worker_args {
+  int nthreads;			/* for the early-stop remaining estimate */
   struct uct_tree *view;
   const struct mc_game *start;
   int sim_cap;
@@ -3935,7 +4012,7 @@ uct_tree_worker(void *argp)
   int sims = 0;
 
   uct_init_move_ordering(v);
-  while (!mc_search_abort
+  while (!mc_search_abort && !mc_earlystop_hit
 	 && sims < a->sim_cap
 	 && __atomic_load_n(v->p_used_nodes, __ATOMIC_RELAXED) < v->num_nodes - 64
 	 && __atomic_load_n(v->p_used_arcs, __ATOMIC_RELAXED) < v->num_arcs - 64) {
@@ -3943,6 +4020,9 @@ uct_tree_worker(void *argp)
     v->game.rng = &v->rng_state;
     uct_traverse_tree_parallel(v, root, 1.0, 0.9);
     sims++;
+    if ((sims & 255) == 0
+	&& mc_earlystop_decided(root, (a->sim_cap - sims) * a->nthreads))
+      mc_earlystop_hit = 1;	/* stops the sibling workers too */
   }
   return NULL;
 }
@@ -4042,10 +4122,12 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
   root = &shared_nodes[0];
   mc_reuse_graft(&views[0], root);
 
+  mc_earlystop_hit = 0;
   for (t = 0; t < nthreads; t++) {
     args[t].view = &views[t];
     args[t].start = starting_position;
     args[t].sim_cap = nodes;
+    args[t].nthreads = nthreads;
     pthread_create(&threads[t], NULL, uct_tree_worker, &args[t]);
   }
   for (t = 0; t < nthreads; t++)
@@ -4216,6 +4298,7 @@ mc_prime_flag_caches(void)
   (void) mc_robust();
   (void) mc_lcb();
   (void) mc_reuse();
+  (void) mc_earlystop();
   (void) mc_avoid_self_atari_enabled();
   (void) mc_mercy_margin();
   (void) lgrf_enabled();
@@ -4506,12 +4589,16 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
    * FIXME: Terribly dirty fix. */
   {
     int sims = 0;
+    mc_earlystop_hit = 0;
     while (!mc_search_abort && sims < nodes
 	   && tree.num_used_arcs < tree.num_arcs - 10) {
       int last_used_arcs = tree.num_used_arcs;
       tree.game = starting_position;
       uct_traverse_tree(&tree, &tree.nodes[0], 1.0, 0.9);
       sims++;
+      if ((sims & 255) == 0
+	  && mc_earlystop_decided(&tree.nodes[0], nodes - sims))
+	break;
       /* FIXME: Ugly workaround for solved positions before running out
        * of nodes.
        */

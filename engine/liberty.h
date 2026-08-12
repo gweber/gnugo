@@ -508,6 +508,7 @@ int mc_move_pattern_ids(int color, int *moves, int *ids);
 float mc_playout_value(int color, int n);
 void mc_abort_search(void);
 void mc_clear_search_abort(void);
+void mc_set_in_ponder(int flag);
 float mc_playout_value_settled(int color, int n, const unsigned char *settled);
 
 void uct_genmove(int color, int *move, int *forbidden_moves,

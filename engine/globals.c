@@ -30,17 +30,24 @@
 #include "params.h"
 #include "config.h"
 
-/* Runtime-tunable strength parameters; defaults reproduce historical
- * hard-coded behavior. Overridable via GNUGO_* env vars (see params.h and
- * load_tunable_params() in interface.c). */
+/* Runtime-tunable strength parameters.  Overridable via GNUGO_* env vars
+ * (see params.h and load_tunable_params() in interface.c).
+ *
+ * Defaults are the parallel-SPSA optimum from self-play tuning (2026-08-12;
+ * 40x40-game iterations, 13x13 level 1), validated by SPRT at level 10
+ * against the historical values (all 1.0 / 1.05 / 1.8): +92 +/- 56 Elo on
+ * 13x13 (162 games) and +43 +/- 35 Elo on 19x19 (390 games).  Direction:
+ * more territorial, less speculative dragon attack and strategic bonus,
+ * bigger invasion malus, smaller lunch multiplier.  The historical
+ * behavior is recoverable by setting the env vars to the old values. */
 struct tunable_params tunable = {
-  1.0,    /* territorial_weight_scale */
-  1.0,    /* strategical_weight_scale */
-  1.0,    /* attack_dragon_weight_scale */
-  1.0,    /* followup_weight_scale */
-  1.0,    /* invasion_malus_weight_scale */
-  1.05,   /* shape_factor_base */
-  1.8     /* lunch_weakness_multiplier */
+  1.1124, /* territorial_weight_scale    (was 1.0) */
+  0.8582, /* strategical_weight_scale    (was 1.0) */
+  0.8333, /* attack_dragon_weight_scale  (was 1.0) */
+  1.0664, /* followup_weight_scale       (was 1.0) */
+  1.2085, /* invasion_malus_weight_scale (was 1.0) */
+  1.0487, /* shape_factor_base           (was 1.05) */
+  1.6167  /* lunch_weakness_multiplier   (was 1.8) */
 };
 
 /* 
