@@ -15,15 +15,18 @@ CREDS="${CGOS_CREDS:-/home/taro/code/archive/mushin-go/training-jax/.cgos_env}"
 : "${CGOS_PASSWORD:?CGOS_PASSWORD not set (source $CREDS)}"
 NAME="${CGOS_NAME:-saigo.gnugo3.9.1b}"
 SERVER="${CGOS_SERVER:-yss-aya.com}"; PORT="${CGOS_PORT:-6809}"
-WRAP="$(pwd)/gnugo-cgos9-gtp.sh"
+# Multi-bot: CGOS_WRAP selects the engine wrapper, and the kill files are
+# per-NAME so several bots (the main one plus the rating-ladder rungs, see
+# ladder-up.sh) can run from this directory without stepping on each other.
+WRAP="${CGOS_WRAP:-$(pwd)/gnugo-cgos9-gtp.sh}"
 CLIENT=/home/taro/code/CGOS/client/cgosGtp.tcl
 # Two kill files: cgosGtp DELETES the file passed via -k once it has seen it
 # (finish game, exit) -- so if the runner loop checked that same file it
 # would find it gone and reconnect forever (observed 2026-08-12: the name
 # switch silently didn't happen).  KILL_CLIENT belongs to the client;
 # KILL is ours and only stop.sh/rm touches it.
-KILL="$(pwd)/kill.txt"; rm -f "$KILL"
-KILL_CLIENT="$(pwd)/kill-client.txt"; rm -f "$KILL_CLIENT"
+KILL="$(pwd)/kill-${NAME}.txt"; rm -f "$KILL"
+KILL_CLIENT="$(pwd)/kill-client-${NAME}.txt"; rm -f "$KILL_CLIENT"
 CFG="$(mktemp /tmp/cgos_gnugo_XXXXXX.cfg)"; chmod 600 "$CFG"; trap 'rm -f "$CFG"' EXIT
 cat > "$CFG" <<CFGEOF
 %section server

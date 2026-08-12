@@ -1,4 +1,4 @@
 gnugo-3.9.1*-bin
-kill.txt
+kill*.txt
 *.log
 sgf/
