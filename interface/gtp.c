@@ -75,6 +75,11 @@ static int current_id;
  */
 FILE *gtp_output_file = NULL;
 
+/* If set, called as soon as a new command line arrives, BEFORE it is
+ * interpreted.  Used to stop background pondering: the engine may only
+ * think between commands, and every handler must see quiescent state. */
+void (*gtp_command_arrived_hook)(void) = NULL;
+
 
 /* Read filehandle gtp_input linewise and interpret as GTP commands. */
 void
@@ -92,8 +97,14 @@ gtp_main_loop(struct gtp_command commands[],
 
   while (status == GTP_OK) {
     /* Read a line from gtp_input. */
-    if (!fgets(line, GTP_BUFSIZE, gtp_input))
+    if (!fgets(line, GTP_BUFSIZE, gtp_input)) {
+      if (gtp_command_arrived_hook)
+	gtp_command_arrived_hook();	/* stop pondering before EOF exit */
       break; /* EOF or some error */
+    }
+
+    if (gtp_command_arrived_hook)
+      gtp_command_arrived_hook();
 
     if (gtp_dump_commands) {
       fputs(line, gtp_dump_commands);

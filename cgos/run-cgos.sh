@@ -17,7 +17,13 @@ NAME="${CGOS_NAME:-saigo.gnugo3.9.1b}"
 SERVER="${CGOS_SERVER:-yss-aya.com}"; PORT="${CGOS_PORT:-6809}"
 WRAP="$(pwd)/gnugo-cgos9-gtp.sh"
 CLIENT=/home/taro/code/CGOS/client/cgosGtp.tcl
+# Two kill files: cgosGtp DELETES the file passed via -k once it has seen it
+# (finish game, exit) -- so if the runner loop checked that same file it
+# would find it gone and reconnect forever (observed 2026-08-12: the name
+# switch silently didn't happen).  KILL_CLIENT belongs to the client;
+# KILL is ours and only stop.sh/rm touches it.
 KILL="$(pwd)/kill.txt"; rm -f "$KILL"
+KILL_CLIENT="$(pwd)/kill-client.txt"; rm -f "$KILL_CLIENT"
 CFG="$(mktemp /tmp/cgos_gnugo_XXXXXX.cfg)"; chmod 600 "$CFG"; trap 'rm -f "$CFG"' EXIT
 cat > "$CFG" <<CFGEOF
 %section server
@@ -29,9 +35,9 @@ cat > "$CFG" <<CFGEOF
     invoke $WRAP
     priority 7
 CFGEOF
-echo "[cgos] $NAME -> $SERVER:$PORT  (stop: touch $KILL)"
+echo "[cgos] $NAME -> $SERVER:$PORT  (stop: ./stop.sh)"
 while [ ! -f "$KILL" ]; do
-  tclsh8.6 "$CLIENT" -c "$CFG" -k "$KILL"
+  tclsh8.6 "$CLIENT" -c "$CFG" -k "$KILL_CLIENT"
   [ -f "$KILL" ] && break
   echo "[cgos] client dropped; reconnecting in 15s"; sleep 15
 done

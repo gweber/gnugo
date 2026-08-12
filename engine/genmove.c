@@ -26,6 +26,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #include "liberty.h"
 #include "sgftree.h"
@@ -398,7 +399,58 @@ monte_carlo_genmove(int color, int allowed_moves[BOARDMAX],
 }
 
 
-/* 
+/* ------------------------- Monte Carlo pondering -------------------------
+ *
+ * Search during the opponent's thinking time.  After our reply has been
+ * played, a background thread runs the ordinary MC search for the OPPONENT
+ * color on the current position; when the next GTP command arrives the
+ * search is aborted and joined BEFORE the command is interpreted, so no
+ * handler ever sees engine state in motion -- the ponder thread runs only
+ * while the main thread is blocked reading input, making the handoff purely
+ * sequential.  The pondered tree lands in the tree-reuse cache exactly like
+ * a normal search's would (uct_genmove stores it), and the next genmove
+ * harvests it through the existing one-ply graft; the ponder search itself
+ * warm-starts from our own genmove's stored tree the same way.  Enabled by
+ * GNUGO_MC_PONDER=1 (which implies GNUGO_MC_REUSE); off by default.
+ */
+static pthread_t ponder_thread;
+static int ponder_active = 0;
+static int ponder_color;
+
+static void *
+ponder_main(void *arg)
+{
+  float value;
+  int resign;
+  UNUSED(arg);
+  monte_carlo_genmove(ponder_color, NULL, &value, &resign);
+  return NULL;			/* move discarded; the tree is the product */
+}
+
+void
+monte_carlo_ponder_start(int color_to_move)
+{
+  const char *p = getenv("GNUGO_MC_PONDER");
+  if (!(p && *p && atoi(p) > 0) || !use_monte_carlo_genmove || ponder_active)
+    return;
+  ponder_color = color_to_move;
+  mc_clear_search_abort();
+  if (pthread_create(&ponder_thread, NULL, ponder_main, NULL) == 0)
+    ponder_active = 1;
+}
+
+void
+monte_carlo_ponder_stop(void)
+{
+  if (!ponder_active)
+    return;
+  mc_abort_search();
+  pthread_join(ponder_thread, NULL);
+  ponder_active = 0;
+  mc_clear_search_abort();
+}
+
+/*
  * Perform the actual move generation.
  *
  * The array allowed_moves restricts which moves may be considered. If

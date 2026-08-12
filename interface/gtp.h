@@ -88,6 +88,10 @@ void gtp_print_vertex(int i, int j);
 
 extern FILE *gtp_output_file;
 
+/* Called as soon as a new command line arrives, before interpretation
+ * (used to stop background pondering).  NULL when unused. */
+extern void (*gtp_command_arrived_hook)(void);
+
 /*
  * Local Variables:
  * tab-width: 8

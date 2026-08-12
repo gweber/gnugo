@@ -301,6 +301,8 @@ int DEBUG_func(int level, const char *fmt, ...);
 #define EXAMINE_ALL                 99
 
 void reset_engine(void);
+void monte_carlo_ponder_start(int color_to_move);
+void monte_carlo_ponder_stop(void);
 void examine_position(int how_much, int aftermath_play);
 void silent_examine_position(int how_much);
 

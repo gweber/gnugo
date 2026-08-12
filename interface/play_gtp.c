@@ -351,6 +351,9 @@ play_gtp(FILE *gtp_input, FILE *gtp_output, FILE *gtp_dump_commands,
   /* Prepare pattern matcher and reading code. */
   reset_engine();
   clearstats();
+  /* Stop any background pondering the moment a new command arrives, and
+   * before EOF shutdown -- handlers must always see quiescent state. */
+  gtp_command_arrived_hook = monte_carlo_ponder_stop;
   gtp_main_loop(commands, gtp_input, gtp_output, gtp_dump_commands);
   if (showstatistics)
     showstats();
@@ -2527,6 +2530,9 @@ gtp_genmove(char *s)
     return gtp_success("resign");
 
   gnugo_play_move(move, color);
+  /* Think on the opponent's clock (no-op unless GNUGO_MC_PONDER=1); the
+   * response below still goes out first -- the search runs in a thread. */
+  monte_carlo_ponder_start(OTHER_COLOR(color));
 
   gtp_start_response(GTP_SUCCESS);
   gtp_print_vertex(I(move), J(move));
