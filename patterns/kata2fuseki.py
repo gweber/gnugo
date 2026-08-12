@@ -39,7 +39,9 @@ WL_MARGIN = 0.03    # accept moves this close to the page's best (wl units)
 VISIT_FRAC = 0.02   # ... and with >= this fraction of the page's max 'av'
                     # ('av' = average visits; the 'v' field is a fixed-point
                     # encoding with wild magnitudes, only useful as > 0)
-MAX_PATTERNS = 150000
+# 450k reaches ~depth 10-11 of the book (150k cut at 8 stones and measured
+# +60 Elo; deeper book plies are free clock on CGOS).  Compiled size ~30MB.
+MAX_PATTERNS = 450000
 
 BOARD_RE = re.compile(r"const board = \[([0-9,]*)\]")
 NEXTPLA_RE = re.compile(r"const nextPla = (\d)")
