@@ -23,13 +23,30 @@
 # without flagging.  Start 8, ramp within [2, 12].
 # CGOS is Tromp-Taylor: chinese rules, positional superko, and
 # --capture-all-dead so dead stones are physically removed before scoring.
+# Weight pins: the binary's DEFAULT valuation weights are the SPSA optimum
+# for the CLASSICAL engine (+92/13x13, +43/19x19) -- but under the 9x9 MC
+# stack the same weights measured mildly NEGATIVE (potential_moves feeds the
+# search a different balance than big-board classical play wants), so the
+# bot pins the historical values.
+# 8 tree threads: measured 4.25x single-thread sims/sec under full box load
+# (4 threads: 2.75x); autolevel converts the throughput into higher levels
+# on the same clock, hence max-level 14 (was 12).  Early stop at margin 1.0
+# is loss-free by construction and banks clock for later moves.
 cd "$(dirname "$0")"
 exec env \
   GNUGO_RAVE=1 \
   GNUGO_MC_AVOID_SELFATARI=1 \
   GNUGO_MC_LCB=1.28 \
-  GNUGO_MC_TREE_THREADS=4 \
+  GNUGO_MC_TREE_THREADS=8 \
   GNUGO_MC_PONDER=1 \
+  GNUGO_MC_EARLYSTOP=1.0 \
+  GNUGO_TERRITORIAL_WEIGHT=1.0 \
+  GNUGO_STRATEGICAL_WEIGHT=1.0 \
+  GNUGO_ATTACK_DRAGON_WEIGHT=1.0 \
+  GNUGO_FOLLOWUP_WEIGHT=1.0 \
+  GNUGO_INVASION_MALUS_WEIGHT=1.0 \
+  GNUGO_SHAPE_FACTOR_BASE=1.05 \
+  GNUGO_LUNCH_MULTIPLIER=1.8 \
   ./gnugo-3.9.1b-bin --mode gtp --monte-carlo \
     --chinese-rules --positional-superko --capture-all-dead \
-    --level 8 --min-level 2 --max-level 12
+    --level 8 --min-level 2 --max-level 14
