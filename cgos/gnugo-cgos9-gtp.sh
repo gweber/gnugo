@@ -9,7 +9,10 @@
 #
 # Config: the measured-strongest NON-experimental MC stack --
 #   tree-parallel 4 threads (+237 over root-par), tuned RAVE (+92),
-#   self-atari avoidance (+31), LCB root selection (+19).
+#   self-atari avoidance (+31), LCB root selection (+19), KataGo book
+#   (+60), pondering on the opponent's clock (+72 local proxy; implies
+#   tree reuse).  On CGOS the opponent thinks on THEIR hardware, so the
+#   pondered sims are genuinely free compute.
 # Time management: gnugo's GTP genmove path runs adjust_level_offset()
 # unconditionally, fed by the time_settings/time_left the CGOS client sends,
 # and the MC sims budget scales with get_level() EVERY move -- so the level
@@ -26,6 +29,7 @@ exec env \
   GNUGO_MC_AVOID_SELFATARI=1 \
   GNUGO_MC_LCB=1.28 \
   GNUGO_MC_TREE_THREADS=4 \
+  GNUGO_MC_PONDER=1 \
   ./gnugo-3.9.1b-bin --mode gtp --monte-carlo \
     --chinese-rules --positional-superko --capture-all-dead \
     --level 8 --min-level 2 --max-level 12
