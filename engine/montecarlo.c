@@ -2940,6 +2940,75 @@ mc_clear_search_abort(void)
  * bound, <1 stops sooner and is no longer loss-free); 0/unset = off.
  * Never fires during pondering (there the idle time is free anyway and a
  * deeper tree is always welcome). */
+/* Score-utility tiebreak (the one KataGo idea that works without a net):
+ * add eps * mean_score (from the mover's perspective) to a child's value in
+ * selection, so among near-equal winrates the search prefers lines that
+ * also hold points -- less slack play in decided positions, where a pure
+ * winrate signal saturates and "any 95% move" looks alike.  This AUGMENTS
+ * the mean backup with a tiebreak; it does not replace the backup operator
+ * (the measured MENTS dead end).  GNUGO_MC_SCOREUTIL=eps in winrate units
+ * per point (0.003 => a 10-point-better line gains 3% selection value);
+ * 0/unset = off. */
+static float mc_scoreutil_val = -1.0f;
+static float
+mc_scoreutil(void)
+{
+  if (mc_scoreutil_val < 0.0f) {
+    const char *v = getenv("GNUGO_MC_SCOREUTIL");
+    mc_scoreutil_val = (v && *v) ? (float) atof(v) : 0.0f;
+    if (mc_scoreutil_val < 0.0f)
+      mc_scoreutil_val = 0.0f;
+  }
+  return mc_scoreutil_val;
+}
+
+/* UNST -- the extension half of search-time management (Baier & Winands):
+ * if, at the end of the regular budget, the decision is UNSTABLE -- the
+ * most-visited root child is not the best-winrate child, or the runner-up
+ * has nearly as many visits -- then extra simulations buy the most Elo
+ * exactly here, so extend the search once by GNUGO_MC_UNST * budget sims.
+ * The autolevel clock schedule absorbs the cost (an extended move lowers
+ * the level of later, easier moves).  0/unset = off; never fires while
+ * pondering. */
+static float mc_unst_val = -1.0f;
+static float
+mc_unst(void)
+{
+  if (mc_unst_val < 0.0f) {
+    const char *v = getenv("GNUGO_MC_UNST");
+    mc_unst_val = (v && *v) ? (float) atof(v) : 0.0f;
+    if (mc_unst_val < 0.0f)
+      mc_unst_val = 0.0f;
+  }
+  return mc_unst_val;
+}
+
+/* Is the root decision unstable enough to deserve an extension? */
+static int
+mc_search_unstable(struct uct_node *root)
+{
+  struct uct_arc *arc;
+  int best_games = -1, second_games = -1;
+  float best_games_wr = 0.0f, best_wr = -1.0f;
+  for (arc = root->child; arc; arc = arc->next) {
+    struct uct_node *node = arc->node;
+    float wr = node->games > 0 ? (float) node->wins / node->games : 0.0f;
+    if (node->games > best_games) {
+      second_games = best_games;
+      best_games = node->games;
+      best_games_wr = wr;
+    }
+    else if (node->games > second_games)
+      second_games = node->games;
+    if (wr > best_wr && node->games > best_games / 4 && node->games > 0)
+      best_wr = wr;
+  }
+  if (best_games <= 0 || second_games < 0)
+    return 0;
+  return best_wr > best_games_wr + 0.02f
+	 || (float) second_games > 0.85f * (float) best_games;
+}
+
 static float mc_earlystop_val = -1.0f;
 static float
 mc_earlystop(void)
@@ -3579,6 +3648,12 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
     value += explore;
     if (crit_alpha > 0.0 && ON_BOARD(m))
       value += crit_alpha * mc_crit_value(tree, m);
+    /* Score-utility tiebreak: mover-perspective mean score (sum_scores is
+     * White-positive), only once real games back the estimate. */
+    if (mc_scoreutil() > 0.0f && child_node->games > 0)
+      value += mc_scoreutil()
+	       * (color == WHITE ? 1.0f : -1.0f)
+	       * (child_node->sum_scores / (float) child_node->games);
     if (value > best_value) {
       best_value = value;
       best_arc = child_arc;
@@ -3698,6 +3773,11 @@ uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
     uct_value = sel_winrate + explore;
     if (crit_alpha > 0.0 && ON_BOARD(child_arc->move))
       uct_value += crit_alpha * mc_crit_value(tree, child_arc->move);
+    /* Score-utility tiebreak (see uct_play_move_rave). */
+    if (mc_scoreutil() > 0.0f && child_node->games > 0)
+      uct_value += mc_scoreutil()
+		   * (tree->game.color_to_move == WHITE ? 1.0f : -1.0f)
+		   * (child_node->sum_scores / (float) child_node->games);
     if (uct_value > best_uct_value) {
       next_arc = child_arc;
       best_uct_value = uct_value;
@@ -4040,7 +4120,9 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
    * reused statistics never displace fresh simulations. */
   int reuse_extra = (mc_reuse() && mc_reuse_cache.have)
 		    ? mc_reuse_cache.used_nodes : 0;
-  int total = nodes * nthreads + 1024 + reuse_extra;
+  /* Pool headroom for a possible UNST extension round on top of graft room. */
+  int total = (int) (nodes * nthreads * (1.0f + mc_unst())) + 1024
+	      + reuse_extra;
   struct uct_node *shared_nodes = malloc((size_t) total * sizeof(*shared_nodes));
   struct uct_arc *shared_arcs = malloc((size_t) total * sizeof(*shared_arcs));
   int *shared_amaf_w = NULL;
@@ -4132,6 +4214,18 @@ uct_genmove_tree_parallel(int nthreads, struct mc_game *starting_position,
   }
   for (t = 0; t < nthreads; t++)
     pthread_join(threads[t], NULL);
+
+  /* UNST extension: if the decision is unstable, buy it one extra round. */
+  if (mc_unst() > 0.0f && !mc_in_ponder && !mc_search_abort
+      && mc_search_unstable(root)) {
+    mc_earlystop_hit = 0;
+    for (t = 0; t < nthreads; t++) {
+      args[t].sim_cap = (int) (mc_unst() * nodes);
+      pthread_create(&threads[t], NULL, uct_tree_worker, &args[t]);
+    }
+    for (t = 0; t < nthreads; t++)
+      pthread_join(threads[t], NULL);
+  }
 
   *move = PASS_MOVE;
   {
@@ -4299,6 +4393,8 @@ mc_prime_flag_caches(void)
   (void) mc_lcb();
   (void) mc_reuse();
   (void) mc_earlystop();
+  (void) mc_scoreutil();
+  (void) mc_unst();
   (void) mc_avoid_self_atari_enabled();
   (void) mc_mercy_margin();
   (void) lgrf_enabled();
@@ -4540,7 +4636,7 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
      * (the sim loop below is additionally sim-counted for the same reason). */
     int reuse_extra = (mc_reuse() && mc_reuse_cache.have)
 		      ? mc_reuse_cache.used_nodes : 0;
-    int pool = nodes + reuse_extra;
+    int pool = (int) (nodes * (1.0f + mc_unst())) + reuse_extra;
     tree.nodes = malloc(pool * sizeof(*tree.nodes));
     gg_assert(tree.nodes);
     tree.arcs = malloc(pool * sizeof(*tree.arcs));
@@ -4604,6 +4700,19 @@ uct_genmove(int color, int *move, int *forbidden_moves, int *allowed_moves,
        */
       if (tree.num_used_arcs == last_used_arcs)
 	break;
+    }
+    /* UNST extension: one extra round when the decision is unstable. */
+    if (mc_unst() > 0.0f && !mc_in_ponder && !mc_search_abort
+	&& mc_search_unstable(&tree.nodes[0])) {
+      int extra = (int) (mc_unst() * nodes);
+      for (sims = 0; !mc_search_abort && sims < extra
+	   && tree.num_used_arcs < tree.num_arcs - 10; sims++) {
+	int last_used_arcs = tree.num_used_arcs;
+	tree.game = starting_position;
+	uct_traverse_tree(&tree, &tree.nodes[0], 1.0, 0.9);
+	if (tree.num_used_arcs == last_used_arcs)
+	  break;
+      }
     }
   }
 
