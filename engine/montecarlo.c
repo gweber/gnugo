@@ -2970,6 +2970,61 @@ mc_scoreutil(void)
  * The autolevel clock schedule absorbs the cost (an extended move lowers
  * the level of later, easier moves).  0/unset = off; never fires while
  * pondering. */
+/* Classical valuation as a ROOT VALUE term ("implicit minimax lite").
+ *
+ * Measured 2026-08-13: disabling the whole classical coupling into MC costs
+ * ~98 Elo, of which the crude end-override carries ~78 (prior ordering alone
+ * is only ~20).  That override is a blunt instrument -- among the moves with
+ * enough visits it simply picks the classically best one, discarding the
+ * search's own ranking.  This knob is the principled form: blend the
+ * classical move value into the ROOT children's selection value, normalized
+ * to [0,1] by the best classical value on the board, so the search trades
+ * the two signals off continuously instead of one vetoing the other.
+ * Root-only: potential_moves is valid for the current position, not for
+ * positions deeper in the tree (that would need the full implicit-minimax
+ * machinery -- a static eval at every expanded node).
+ * GNUGO_MC_CLASSICAL_ROOT=w in winrate units; 0/unset = off. */
+static float mc_classical_root_val = -1.0f;
+static float
+mc_classical_root(void)
+{
+  if (mc_classical_root_val < 0.0f) {
+    const char *v = getenv("GNUGO_MC_CLASSICAL_ROOT");
+    mc_classical_root_val = (v && *v) ? (float) atof(v) : 0.0f;
+    if (mc_classical_root_val < 0.0f)
+      mc_classical_root_val = 0.0f;
+  }
+  return mc_classical_root_val;
+}
+
+/* Largest classical move value on the board, for normalization; computed
+ * once per search by the main thread (workers only read it). */
+static float mc_classical_max = 0.0f;
+
+static void
+mc_classical_root_init(void)
+{
+  int pos;
+  mc_classical_max = 0.0f;
+  if (mc_classical_root() <= 0.0f)
+    return;
+  for (pos = BOARDMIN; pos < BOARDMAX; pos++)
+    if (ON_BOARD(pos) && potential_moves[pos] > mc_classical_max)
+      mc_classical_max = potential_moves[pos];
+}
+
+/* Normalized classical bonus for a root child's move (0 when off or when
+ * this node is not the root). */
+static float
+mc_classical_bonus(struct uct_tree *tree, struct uct_node *node, int move)
+{
+  float w = mc_classical_root();
+  if (w <= 0.0f || mc_classical_max <= 0.0f || node != &tree->nodes[0]
+      || !ON_BOARD(move))
+    return 0.0f;
+  return w * (potential_moves[move] / mc_classical_max);
+}
+
 static float mc_unst_val = -1.0f;
 static float
 mc_unst(void)
@@ -3654,6 +3709,7 @@ uct_play_move_rave(struct uct_tree *tree, struct uct_node *node, float alpha,
       value += mc_scoreutil()
 	       * (color == WHITE ? 1.0f : -1.0f)
 	       * (child_node->sum_scores / (float) child_node->games);
+    value += mc_classical_bonus(tree, node, m);
     if (value > best_value) {
       best_value = value;
       best_arc = child_arc;
@@ -3778,6 +3834,7 @@ uct_play_move(struct uct_tree *tree, struct uct_node *node, float alpha,
       uct_value += mc_scoreutil()
 		   * (tree->game.color_to_move == WHITE ? 1.0f : -1.0f)
 		   * (child_node->sum_scores / (float) child_node->games);
+    uct_value += mc_classical_bonus(tree, node, child_arc->move);
     if (uct_value > best_uct_value) {
       next_arc = child_arc;
       best_uct_value = uct_value;
@@ -4395,6 +4452,8 @@ mc_prime_flag_caches(void)
   (void) mc_earlystop();
   (void) mc_scoreutil();
   (void) mc_unst();
+  (void) mc_classical_root();
+  mc_classical_root_init();	/* snapshot the classical normalizer */
   (void) mc_avoid_self_atari_enabled();
   (void) mc_mercy_margin();
   (void) lgrf_enabled();
