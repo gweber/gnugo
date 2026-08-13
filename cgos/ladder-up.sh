@@ -13,7 +13,10 @@ start() {  # name wrapper
     "cd $(pwd) && CGOS_NAME=$1 CGOS_WRAP=$(pwd)/$2 ./run-cgos.sh 2>&1 | tee -a ladder-$1.log"
   echo "[ladder] started $1 ($2) in tmux $session"
 }
+# NOTE: CGOS rejects names longer than 18 characters (the server answers
+# "User name must be no more than 18 characters long." and the client then
+# reconnect-loops forever).  Keep every name short.
 start saigo.gnugo3.9.1      ladder-391.sh
-start saigo.gnugo3.9.1b-l3  ladder-l3.sh
-start saigo.gnugo3.9.1b-l1  ladder-l1.sh
+start saigo.gnugo-l3        ladder-l3.sh
+start saigo.gnugo-l1        ladder-l1.sh
 start saigo.gnugoclassic    ladder-classic.sh

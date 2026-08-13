@@ -13,8 +13,8 @@ stop_one() {
 case "${1:-saigo.gnugo3.9.1b}" in
   all)
     for f in kill-client-*.txt; do :; done   # no-op if none exist yet
-    for n in saigo.gnugo3.9.1b saigo.gnugo3.9.1 saigo.gnugo3.9.1b-l3 \
-	     saigo.gnugo3.9.1b-l1 saigo.gnugoclassic; do
+    for n in saigo.gnugo3.9.1b saigo.gnugo3.9.1 saigo.gnugo-l3 \
+	     saigo.gnugo-l1 saigo.gnugoclassic; do
       stop_one "$n"
     done
     ;;
