@@ -25,13 +25,22 @@ import random
 
 from parmatch import parallel_match
 
-# name -> (low, high). Same knobs as partune_mc.
+# name -> (low, high). Same knobs as partune_mc.  Overridable with
+# --params "NAME:lo:hi,NAME:lo:hi" for tuning arbitrary env knobs.
 PARAMS = {
     "GNUGO_RAVE_EQUIV": (30.0, 400.0),
     "GNUGO_RAVE_C":     (0.10, 0.60),
     "GNUGO_RAVE_FPU":   (0.30, 1.10),
     "GNUGO_MC_SHRINK":  (0.0, 1.0),
 }
+
+
+def parse_params(spec):
+    out = {}
+    for part in spec.split(","):
+        name, lo, hi = part.split(":")
+        out[name] = (float(lo), float(hi))
+    return out
 
 
 def sample_config(rng):
@@ -61,7 +70,12 @@ def main():
     ap.add_argument("--komi", type=float, default=7.5)
     ap.add_argument("--workers", type=int, default=16)
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument("--params", default=None,
+                    help="override search space: NAME:lo:hi,NAME:lo:hi")
     args = ap.parse_args()
+    if args.params:
+        global PARAMS
+        PARAMS = parse_params(args.params)
 
     rng = random.Random(args.seed)
     configs = [sample_config(rng) for _ in range(args.n)]
