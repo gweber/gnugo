@@ -38,6 +38,17 @@ cat > "$CFG" <<CFGEOF
     invoke $WRAP
     priority 7
 CFGEOF
+# Refresh the engine snapshot if a newer build exists.  rm+cp, never plain
+# cp: the ladder rungs share this binary, so it is usually "Text file busy"
+# -- unlinking keeps running processes on the old inode while new starts get
+# the new file.  (A silent cp failure once left the bot running a binary
+# that predated the features its wrapper was enabling.)
+if [ -n "${CGOS_REFRESH_BIN:-}" ] && [ -x "$CGOS_REFRESH_BIN" ]; then
+  if ! cmp -s "$CGOS_REFRESH_BIN" gnugo-3.9.1b-bin; then
+    rm -f gnugo-3.9.1b-bin && cp "$CGOS_REFRESH_BIN" gnugo-3.9.1b-bin \
+      && echo "[cgos] engine snapshot refreshed from $CGOS_REFRESH_BIN"
+  fi
+fi
 echo "[cgos] $NAME -> $SERVER:$PORT  (stop: ./stop.sh)"
 while [ ! -f "$KILL" ]; do
   tclsh8.6 "$CLIENT" -c "$CFG" -k "$KILL_CLIENT"
