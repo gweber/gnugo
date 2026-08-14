@@ -8,6 +8,11 @@
 cd "$(dirname "$0")"
 stop_one() {
   touch "kill-$1.txt" "kill-client-$1.txt"
+  # Legacy paths: clients started before the per-name kill files existed
+  # watch these instead.  A stale client silently ignoring the new files
+  # once left the bot running an outdated config for 32 hours -- always
+  # verify with `pgrep -af cgosGtp` which -k path the live client watches.
+  touch kill.txt kill-client.txt
   echo "[cgos] stop requested for $1; it exits after the current game."
 }
 case "${1:-saigo.gnugo3.9.1b}" in
