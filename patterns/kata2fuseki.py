@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """kata2fuseki.py -- build a fuseki9.dbz from KataGo's published 9x9 book.
 
+The source book (katagobooks.org, "book9x9tt") is Copyright 2026 David J Wu
+("lightvector") and distributed under the MIT license; the generated database
+is a derived work.  See FUSEKI9-KATAGO-LICENSE.txt in this directory for the
+full notice, which MIT requires to accompany copies.
+
 Reads the katagobooks.org HTML dump (book9x9tt: Tromp-Taylor, komi 7 --
 exactly CGOS 9x9 rules) in ONE streaming pass over the tarball and emits
 gnu go's compressed fuseki database format:
